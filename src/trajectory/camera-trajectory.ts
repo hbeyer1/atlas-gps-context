@@ -11,6 +11,43 @@ export type CameraView = {
 
 export type SampledCameraView = Omit<CameraView, "id">;
 
+export function cameraViewLookingAt(
+  id: string,
+  position: [number, number, number],
+  target: [number, number, number],
+  fovRadians: number,
+): CameraView {
+  const camera = new THREE.PerspectiveCamera();
+  camera.position.set(...position);
+  camera.lookAt(new THREE.Vector3(...target));
+  return {
+    id,
+    position,
+    quaternion: camera.quaternion.toArray(),
+    fovRadians,
+  };
+}
+
+export function cameraPathTarget(
+  start: CameraView,
+  groundTarget: [number, number, number],
+): [number, number, number] {
+  const position = new THREE.Vector3(...start.position);
+  const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(
+    new THREE.Quaternion(...start.quaternion),
+  );
+  const horizontalForward = Math.hypot(forward.x, forward.z);
+  const horizontalDistance = Math.hypot(
+    groundTarget[0] - start.position[0],
+    groundTarget[2] - start.position[2],
+  );
+  const targetY =
+    horizontalForward > 1e-5
+      ? position.y + (forward.y * horizontalDistance) / horizontalForward
+      : position.y;
+  return [groundTarget[0], targetY, groundTarget[2]];
+}
+
 /** Sample a smooth path that preserves each captured camera's orientation. */
 export function sampleCameraPath(
   views: readonly CameraView[],

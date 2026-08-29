@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { buildTargetCameras, sampleCameraPath, type CameraView } from "./camera-trajectory";
+import * as THREE from "three";
+import {
+  buildTargetCameras,
+  cameraPathTarget,
+  cameraViewLookingAt,
+  sampleCameraPath,
+  type CameraView,
+} from "./camera-trajectory";
 
 const START: CameraView = {
   id: "start",
@@ -60,5 +67,34 @@ describe("buildTargetCameras", () => {
     expect(cameras[0]?.intrinsics).toMatchObject({ width: 1280, height: 720 });
     expect(cameras[0]?.extrinsics.coordinateSystem).toBe("rub");
     expect(cameras[1]?.extrinsics.position).toEqual(END.position);
+  });
+});
+
+describe("click-to-place camera points", () => {
+  it("aims a placed camera at the subject", () => {
+    const view = cameraViewLookingAt(
+      "point-2",
+      [4, 1, 0],
+      [0, 1, 0],
+      Math.PI / 3,
+    );
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(
+      new THREE.Quaternion(...view.quaternion),
+    );
+
+    expect(forward.x).toBeCloseTo(-1);
+    expect(forward.y).toBeCloseTo(0);
+    expect(forward.z).toBeCloseTo(0);
+  });
+
+  it("keeps the initial camera pitch when choosing the shared subject target", () => {
+    const pitchedStart: CameraView = {
+      ...START,
+      quaternion: new THREE.Quaternion()
+        .setFromEuler(new THREE.Euler(Math.PI / 4, 0, 0))
+        .toArray(),
+    };
+
+    expect(cameraPathTarget(pitchedStart, [0, 0, 0])[1]).toBeCloseTo(5);
   });
 });
