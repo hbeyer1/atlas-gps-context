@@ -1,5 +1,5 @@
 import type { PinholeCamera } from "./common";
-import { squareIntrinsicsFromRadians } from "./common";
+import { createIntrinsicsFromFov } from "./common";
 import * as THREE from "three";
 
 export type CameraView = {
@@ -71,10 +71,15 @@ export function sampleCameraPath(
 export function buildTargetCameras(
   views: readonly CameraView[],
   frameCount: number,
-  imageSize: number,
+  width: number,
+  height: number,
 ): PinholeCamera[] {
   return sampleCameraPath(views, frameCount).map((view) => ({
-    intrinsics: squareIntrinsicsFromRadians(imageSize, view.fovRadians),
+    intrinsics: createIntrinsicsFromFov(
+      THREE.MathUtils.radToDeg(view.fovRadians),
+      width,
+      height,
+    ),
     extrinsics: {
       position: view.position,
       quaternion: view.quaternion,

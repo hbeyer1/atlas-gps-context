@@ -54,10 +54,10 @@ describe("sampleCameraPath", () => {
 });
 
 describe("buildTargetCameras", () => {
-  it("uses square output intrinsics and Three.js camera coordinates", () => {
-    const cameras = buildTargetCameras([START, END], 2, 512);
+  it("uses 720p output intrinsics and Three.js camera coordinates", () => {
+    const cameras = buildTargetCameras([START, END], 2, 1280, 720);
 
-    expect(cameras[0]?.intrinsics).toMatchObject({ width: 512, height: 512 });
+    expect(cameras[0]?.intrinsics).toMatchObject({ width: 1280, height: 720 });
     expect(cameras[0]?.extrinsics.coordinateSystem).toBe("rub");
     expect(cameras[1]?.extrinsics.position).toEqual(END.position);
   });
