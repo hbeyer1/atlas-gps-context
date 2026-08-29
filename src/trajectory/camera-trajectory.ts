@@ -10,6 +10,9 @@ export type CameraView = {
 };
 
 export type SampledCameraView = Omit<CameraView, "id">;
+export type DrawPoint = [number, number];
+
+const DRAWN_CONTROL_POINTS = 6;
 
 export function cameraViewLookingAt(
   id: string,
@@ -46,6 +49,73 @@ export function cameraPathTarget(
       ? position.y + (forward.y * horizontalDistance) / horizontalForward
       : position.y;
   return [groundTarget[0], targetY, groundTarget[2]];
+}
+
+export function cameraMapAxes(reference: CameraView): {
+  right: [number, number, number];
+  forward: [number, number, number];
+} {
+  const quaternion = new THREE.Quaternion(...reference.quaternion);
+  const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(quaternion);
+  forward.y = 0;
+  if (forward.lengthSq() < 1e-5) forward.set(0, 0, -1);
+  forward.normalize();
+  const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0));
+  right.y = 0;
+  right.normalize();
+  return { right: right.toArray(), forward: forward.toArray() };
+}
+
+export function cameraViewsFromDrawnPath(
+  stroke: readonly DrawPoint[],
+  reference: CameraView,
+  groundTarget: [number, number, number],
+  radius: number,
+): CameraView[] {
+  const points = sampleDrawnPath(stroke, DRAWN_CONTROL_POINTS);
+  if (points.length < 2) return [];
+
+  const target = cameraPathTarget(reference, groundTarget);
+  const { right, forward } = cameraMapAxes(reference);
+  const rightVector = new THREE.Vector3(...right);
+  const forwardVector = new THREE.Vector3(...forward);
+
+  return points.map(([x, y], index) => {
+    const position = new THREE.Vector3(groundTarget[0], reference.position[1], groundTarget[2])
+      .addScaledVector(rightVector, (x - 0.5) * radius * 2)
+      .addScaledVector(forwardVector, (0.5 - y) * radius * 2);
+    return cameraViewLookingAt(
+      `drawn-frame-${index + 1}`,
+      position.toArray(),
+      target,
+      reference.fovRadians,
+    );
+  });
+}
+
+function sampleDrawnPath(stroke: readonly DrawPoint[], count: number): DrawPoint[] {
+  if (stroke.length < 2) return [];
+
+  const distances = [0];
+  for (let index = 1; index < stroke.length; index++) {
+    const previous = stroke[index - 1]!;
+    const current = stroke[index]!;
+    distances.push(distances[index - 1]! + Math.hypot(current[0] - previous[0], current[1] - previous[1]));
+  }
+  const total = distances.at(-1)!;
+  if (total < 0.02) return [];
+
+  return Array.from({ length: count }, (_, sampleIndex) => {
+    const wanted = (sampleIndex / (count - 1)) * total;
+    let segment = 1;
+    while (segment < distances.length - 1 && distances[segment]! < wanted) segment++;
+    const startDistance = distances[segment - 1]!;
+    const segmentDistance = distances[segment]! - startDistance;
+    const amount = segmentDistance > 0 ? (wanted - startDistance) / segmentDistance : 0;
+    const start = stroke[segment - 1]!;
+    const end = stroke[segment]!;
+    return [THREE.MathUtils.lerp(start[0], end[0], amount), THREE.MathUtils.lerp(start[1], end[1], amount)];
+  });
 }
 
 /** Sample a smooth path that preserves each captured camera's orientation. */

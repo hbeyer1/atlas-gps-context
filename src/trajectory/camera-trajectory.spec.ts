@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import * as THREE from "three";
 import {
   buildTargetCameras,
+  cameraMapAxes,
   cameraPathTarget,
   cameraViewLookingAt,
+  cameraViewsFromDrawnPath,
   sampleCameraPath,
   type CameraView,
 } from "./camera-trajectory";
@@ -96,5 +98,42 @@ describe("click-to-place camera points", () => {
     };
 
     expect(cameraPathTarget(pitchedStart, [0, 0, 0])[1]).toBeCloseTo(5);
+  });
+});
+
+describe("2D drawn camera paths", () => {
+  it("turns one stroke into a 3D path without using the reference camera as frame 1", () => {
+    const reference: CameraView = {
+      id: "reference",
+      position: [0, 2, 5],
+      quaternion: [0, 0, 0, 1],
+      fovRadians: Math.PI / 3,
+    };
+
+    const views = cameraViewsFromDrawnPath(
+      [
+        [0, 0],
+        [1, 1],
+      ],
+      reference,
+      [0, 0, 0],
+      10,
+    );
+
+    expect(views).toHaveLength(6);
+    expect(views[0]?.position).toEqual([-10, 2, -10]);
+    expect(views.at(-1)?.position).toEqual([10, 2, 10]);
+    expect(views[0]?.position).not.toEqual(reference.position);
+  });
+
+  it("orients the 2D map to the reference camera", () => {
+    expect(cameraMapAxes(START)).toEqual({
+      right: [1, 0, 0],
+      forward: [0, 0, -1],
+    });
+  });
+
+  it("ignores a click without a drawn line", () => {
+    expect(cameraViewsFromDrawnPath([[0.5, 0.5]], START, [0, 0, 0], 10)).toEqual([]);
   });
 });
