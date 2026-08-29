@@ -35,16 +35,60 @@ export function trajectoryPathFromSegments(
   for (const segment of segments) {
     for (const point of segment.points) {
       const previous = path.at(-1);
-      if (
-        !previous ||
-        new THREE.Vector3(...point).distanceTo(new THREE.Vector3(...previous)) >
-          1e-5
-      ) {
+      if (!previous || !sameTrajectoryPoint(point, previous)) {
         path.push(point);
       }
     }
   }
   return path;
+}
+
+export function moveTrajectoryPoint(
+  segments: readonly TrajectorySegment[],
+  segmentId: string,
+  pointIndex: number,
+  position: TrajectoryPoint,
+): TrajectorySegment[] {
+  const segmentIndex = segments.findIndex(
+    (segment) => segment.id === segmentId,
+  );
+  const segment = segments[segmentIndex]!;
+  const previousPosition = segment.points[pointIndex]!;
+
+  return segments.map((current, currentIndex) => {
+    const points = [...current.points];
+    let changed = false;
+    if (currentIndex === segmentIndex) {
+      points[pointIndex] = position;
+      changed = true;
+    }
+    if (
+      currentIndex === segmentIndex - 1 &&
+      pointIndex === 0 &&
+      sameTrajectoryPoint(points.at(-1)!, previousPosition)
+    ) {
+      points[points.length - 1] = position;
+      changed = true;
+    }
+    if (
+      currentIndex === segmentIndex + 1 &&
+      pointIndex === segment.points.length - 1 &&
+      sameTrajectoryPoint(points[0]!, previousPosition)
+    ) {
+      points[0] = position;
+      changed = true;
+    }
+    return changed ? { ...current, points } : current;
+  });
+}
+
+function sameTrajectoryPoint(
+  first: TrajectoryPoint,
+  second: TrajectoryPoint,
+): boolean {
+  return (
+    new THREE.Vector3(...first).distanceTo(new THREE.Vector3(...second)) <= 1e-5
+  );
 }
 
 export function cameraViewLookingAt(
@@ -167,11 +211,7 @@ export function appendDrawnTrajectory(
   const path = [...existing];
   for (const point of newPoints) {
     const previous = path.at(-1);
-    if (
-      !previous ||
-      new THREE.Vector3(...point).distanceTo(new THREE.Vector3(...previous)) >
-        1e-5
-    ) {
+    if (!previous || !sameTrajectoryPoint(point, previous)) {
       path.push(point);
     }
   }

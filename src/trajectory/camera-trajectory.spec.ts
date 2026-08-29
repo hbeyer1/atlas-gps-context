@@ -7,6 +7,7 @@ import {
   cameraPathTarget,
   cameraViewLookingAt,
   cameraViewsFromTrajectory,
+  moveTrajectoryPoint,
   projectTrajectoryPoint,
   sampleCameraPath,
   trajectoryFloorBoundary,
@@ -149,6 +150,60 @@ const TURNED_VIEW = cameraDrawingView(
 );
 
 describe("3D drawn camera paths", () => {
+  it("moves a shared part endpoint without splitting the path", () => {
+    const parts = [
+      {
+        id: "one",
+        points: [
+          [0, 1, 0],
+          [1, 1, 0],
+        ],
+      },
+      {
+        id: "two",
+        points: [
+          [1, 1, 0],
+          [2, 1, 0],
+        ],
+      },
+    ] satisfies { id: string; points: [number, number, number][] }[];
+
+    const moved = moveTrajectoryPoint(parts, "one", 1, [1, 3, -2]);
+
+    expect(moved[0]?.points.at(-1)).toEqual([1, 3, -2]);
+    expect(moved[1]?.points[0]).toEqual([1, 3, -2]);
+    expect(trajectoryPathFromSegments(moved)).toEqual([
+      [0, 1, 0],
+      [1, 3, -2],
+      [2, 1, 0],
+    ]);
+    expect(parts[0]?.points.at(-1)).toEqual([1, 1, 0]);
+  });
+
+  it("does not move an unrelated part across a deleted-path gap", () => {
+    const parts = [
+      {
+        id: "one",
+        points: [
+          [0, 1, 0],
+          [1, 1, 0],
+        ],
+      },
+      {
+        id: "three",
+        points: [
+          [2, 1, 0],
+          [3, 1, 0],
+        ],
+      },
+    ] satisfies { id: string; points: [number, number, number][] }[];
+
+    const moved = moveTrajectoryPoint(parts, "one", 1, [1, 3, -2]);
+
+    expect(moved[0]?.points.at(-1)).toEqual([1, 3, -2]);
+    expect(moved[1]?.points[0]).toEqual([2, 1, 0]);
+  });
+
   it("keeps downstream anchors when an earlier path part is deleted", () => {
     const parts = [
       {
