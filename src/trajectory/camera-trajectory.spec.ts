@@ -3,12 +3,14 @@ import * as THREE from "three";
 import {
   appendDrawnTrajectory,
   buildTargetCameras,
-  cameraMapAxes,
+  cameraDrawingView,
   cameraPathTarget,
   cameraViewLookingAt,
   cameraViewsFromTrajectory,
   projectTrajectoryPoint,
   sampleCameraPath,
+  trajectoryFloorBoundary,
+  trajectoryPathFromSegments,
   unprojectTrajectoryPoint,
   type CameraView,
   type TrajectorySpace,
@@ -29,20 +31,23 @@ const END: CameraView = {
 };
 
 describe("sampleCameraPath", () => {
-  it("keeps the captured endpoint poses", () => {
+  it("keeps endpoint positions and faces forward along a moving path", () => {
     const samples = sampleCameraPath([START, END], 9);
+    const pathForward = new THREE.Vector3(...END.position)
+      .sub(new THREE.Vector3(...START.position))
+      .normalize();
 
     expect(samples).toHaveLength(9);
-    expect(samples[0]).toEqual({
-      position: START.position,
-      quaternion: START.quaternion,
-      fovRadians: START.fovRadians,
-    });
-    expect(samples.at(-1)).toEqual({
-      position: END.position,
-      quaternion: END.quaternion,
-      fovRadians: END.fovRadians,
-    });
+    expect(samples[0]?.position).toEqual(START.position);
+    expect(samples[0]?.fovRadians).toBe(START.fovRadians);
+    expect(samples.at(-1)?.position).toEqual(END.position);
+    expect(samples.at(-1)?.fovRadians).toBe(END.fovRadians);
+    for (const sample of [samples[0]!, samples.at(-1)!]) {
+      const cameraForward = new THREE.Vector3(0, 0, -1).applyQuaternion(
+        new THREE.Quaternion(...sample.quaternion),
+      );
+      expect(cameraForward.dot(pathForward)).toBeCloseTo(1);
+    }
   });
 
   it("returns no path until two views have been captured", () => {
@@ -63,6 +68,33 @@ describe("sampleCameraPath", () => {
     expect(samples[1]?.quaternion[1]).toBeCloseTo(Math.sin(Math.PI / 16));
     expect(samples[2]?.quaternion[1]).toBeCloseTo(Math.sin(Math.PI / 8));
     expect(samples[3]?.quaternion[1]).toBeCloseTo(Math.sin((3 * Math.PI) / 16));
+  });
+
+  it("faces every sampled camera along a curved spline", () => {
+    const views = cameraViewsFromTrajectory(
+      [
+        [0, 1, 0],
+        [0.2, 1.5, -3],
+        [7, 2, -2],
+        [8, 4, 5],
+      ],
+      START,
+    );
+    const samples = sampleCameraPath(views, 51);
+
+    for (let index = 0; index < samples.length; index += 1) {
+      const previous = new THREE.Vector3(
+        ...samples[Math.max(0, index - 1)]!.position,
+      );
+      const next = new THREE.Vector3(
+        ...samples[Math.min(samples.length - 1, index + 1)]!.position,
+      );
+      const pathForward = next.sub(previous).normalize();
+      const cameraForward = new THREE.Vector3(0, 0, -1).applyQuaternion(
+        new THREE.Quaternion(...samples[index]!.quaternion),
+      );
+      expect(cameraForward.dot(pathForward)).toBeGreaterThan(0.995);
+    }
   });
 });
 
@@ -107,59 +139,95 @@ describe("click-to-place camera points", () => {
 
 const SPACE: TrajectorySpace = {
   center: [0, 0, 0],
-  right: [1, 0, 0],
-  forward: [0, 0, -1],
-  horizontalRadius: 10,
-  maximumHeight: 10,
+  radius: 10,
 };
+const FRONT_VIEW = cameraDrawingView([0, 0, 0, 1]);
+const TURNED_VIEW = cameraDrawingView(
+  new THREE.Quaternion()
+    .setFromEuler(new THREE.Euler(-Math.PI / 6, Math.PI / 4, 0))
+    .toArray(),
+);
 
 describe("3D drawn camera paths", () => {
-  it("projects the same endpoint into the top, front, and side views", () => {
-    const point: [number, number, number] = [5, 4, -2];
+  it("keeps downstream anchors when an earlier path part is deleted", () => {
+    const parts = [
+      {
+        id: "one",
+        points: [
+          [0, 1, 0],
+          [1, 1, 0],
+        ],
+      },
+      {
+        id: "two",
+        points: [
+          [1, 1, 0],
+          [2, 1, 0],
+        ],
+      },
+      {
+        id: "three",
+        points: [
+          [2, 1, 0],
+          [3, 1, 0],
+        ],
+      },
+    ] satisfies { id: string; points: [number, number, number][] }[];
 
-    expect(projectTrajectoryPoint(point, "top", SPACE)).toEqual([0.75, 0.4]);
-    expect(projectTrajectoryPoint(point, "front", SPACE)).toEqual([
-      0.75,
-      0.516,
+    expect(trajectoryPathFromSegments(parts.slice(1))).toEqual([
+      [1, 1, 0],
+      [2, 1, 0],
+      [3, 1, 0],
     ]);
-    expect(projectTrajectoryPoint(point, "side", SPACE)).toEqual([
-      0.6,
-      0.516,
+    expect(
+      trajectoryPathFromSegments(parts.filter((part) => part.id !== "two")),
+    ).toEqual([
+      [0, 1, 0],
+      [1, 1, 0],
+      [2, 1, 0],
+      [3, 1, 0],
     ]);
   });
 
-  it("round-trips a point through every fixed drawing view", () => {
+  it("projects a point using the main camera angle", () => {
     const point: [number, number, number] = [5, 4, -2];
 
-    for (const projection of ["top", "front", "side"] as const) {
-      const roundTrip = unprojectTrajectoryPoint(
-        projectTrajectoryPoint(point, projection, SPACE),
-        projection,
-        SPACE,
-        point,
-      );
-      expect(roundTrip[0]).toBeCloseTo(point[0]);
-      expect(roundTrip[1]).toBeCloseTo(point[1]);
-      expect(roundTrip[2]).toBeCloseTo(point[2]);
-    }
+    expect(projectTrajectoryPoint(point, FRONT_VIEW, SPACE)).toEqual([
+      0.75, 0.3,
+    ]);
+    expect(projectTrajectoryPoint(point, TURNED_VIEW, SPACE)).not.toEqual([
+      0.75, 0.3,
+    ]);
   });
 
-  it("preserves the hidden coordinate when a stroke continues in another view", () => {
+  it("round-trips a point through an arbitrary drawing angle", () => {
+    const point: [number, number, number] = [5, 4, -2];
+    const roundTrip = unprojectTrajectoryPoint(
+      projectTrajectoryPoint(point, TURNED_VIEW, SPACE),
+      TURNED_VIEW,
+      SPACE,
+      point,
+    );
+
+    expect(roundTrip[0]).toBeCloseTo(point[0]);
+    expect(roundTrip[1]).toBeCloseTo(point[1]);
+    expect(roundTrip[2]).toBeCloseTo(point[2]);
+  });
+
+  it("preserves depth when a stroke continues from a rotated main view", () => {
     const existing: [number, number, number][] = [[4, 2, -6]];
     const continued = appendDrawnTrajectory(
       existing,
-      [
-        projectTrajectoryPoint(existing[0]!, "front", SPACE),
-        [0.8, 0.2],
-      ],
-      "front",
+      [projectTrajectoryPoint(existing[0]!, TURNED_VIEW, SPACE), [0.8, 0.2]],
+      TURNED_VIEW,
       SPACE,
       START.position,
     );
+    const forward = new THREE.Vector3(...TURNED_VIEW.forward);
 
-    expect(continued.at(-1)?.[0]).toBeCloseTo(6);
-    expect(continued.at(-1)?.[1]).toBeCloseTo(7.6744186);
-    expect(continued.at(-1)?.[2]).toBeCloseTo(-6);
+    expect(new THREE.Vector3(...continued.at(-1)!).dot(forward)).toBeCloseTo(
+      new THREE.Vector3(...existing[0]!).dot(forward),
+    );
   });
 
   it("lets the first drawn point differ from the reference camera", () => {
@@ -169,53 +237,58 @@ describe("3D drawn camera paths", () => {
         [0, 0],
         [1, 1],
       ],
-      "top",
+      FRONT_VIEW,
       SPACE,
       START.position,
     );
 
-    expect(path[0]).toEqual([-10, 1, -10]);
+    expect(path[0]).toEqual([-10, 10, 4]);
     expect(path[0]).not.toEqual(START.position);
   });
 
-  it("keeps raised height when drawing top, front, then top again", () => {
-    const topPath = appendDrawnTrajectory(
+  it("keeps earlier points when the main camera rotates between strokes", () => {
+    const firstPath = appendDrawnTrajectory(
       [],
       [
         [0.5, 0.5],
         [0.6, 0.4],
       ],
-      "top",
-      SPACE,
-      START.position,
-    );
-    const raisedPath = appendDrawnTrajectory(
-      topPath,
-      [
-        projectTrajectoryPoint(topPath.at(-1)!, "front", SPACE),
-        [0.7, 0.3],
-      ],
-      "front",
+      FRONT_VIEW,
       SPACE,
       START.position,
     );
     const finalPath = appendDrawnTrajectory(
-      raisedPath,
+      firstPath,
       [
-        projectTrajectoryPoint(raisedPath.at(-1)!, "top", SPACE),
-        [0.8, 0.2],
+        projectTrajectoryPoint(firstPath.at(-1)!, TURNED_VIEW, SPACE),
+        [0.7, 0.3],
       ],
-      "top",
+      TURNED_VIEW,
       SPACE,
       START.position,
     );
 
-    expect(finalPath.slice(0, topPath.length)).toEqual(topPath);
-    expect(finalPath.at(-1)?.[1]).toBeCloseTo(raisedPath.at(-1)![1]);
+    expect(finalPath.slice(0, firstPath.length)).toEqual(firstPath);
   });
 
   it("clamps vertical drawing and spline output to the floor", () => {
-    expect(unprojectTrajectoryPoint([0.5, 1], "front", SPACE, START.position)[1]).toBe(0);
+    expect(
+      unprojectTrajectoryPoint([0.5, 1], FRONT_VIEW, SPACE, START.position)[1],
+    ).toBe(0);
+    expect(trajectoryFloorBoundary(FRONT_VIEW, SPACE, START.position)).toEqual([
+      [0, 0.5],
+      [1, 0.5],
+    ]);
+    const turnedBoundary = trajectoryFloorBoundary(
+      TURNED_VIEW,
+      SPACE,
+      START.position,
+    )!;
+    for (const point of turnedBoundary) {
+      expect(
+        unprojectTrajectoryPoint(point, TURNED_VIEW, SPACE, START.position)[1],
+      ).toBeCloseTo(0);
+    }
     const samples = sampleCameraPath(
       [
         { ...START, position: [0, 1, 0] },
@@ -229,29 +302,34 @@ describe("3D drawn camera paths", () => {
   });
 
   it("turns a multi-view trajectory into spline control cameras", () => {
-    const views = cameraViewsFromTrajectory(
-      [
-        [-10, 2, -10],
-        [0, 5, 0],
-        [10, 3, 10],
-      ],
-      START,
-      [0, 0, 0],
-    );
+    const path: [number, number, number][] = [
+      [-10, 2, -10],
+      [0, 5, 0],
+      [10, 3, 10],
+    ];
+    const views = cameraViewsFromTrajectory(path, START);
 
     expect(views).toHaveLength(3);
     expect(views[0]?.position).toEqual([-10, 2, -10]);
     expect(views.at(-1)?.position).toEqual([10, 3, 10]);
+    const firstForward = new THREE.Vector3(0, 0, -1).applyQuaternion(
+      new THREE.Quaternion(...views[0]!.quaternion),
+    );
+    const routeForward = new THREE.Vector3(...path[1]!)
+      .sub(new THREE.Vector3(...path[0]!))
+      .normalize();
+    expect(firstForward.dot(routeForward)).toBeCloseTo(1);
   });
 
-  it("orients the 2D map to the reference camera", () => {
-    expect(cameraMapAxes(START)).toEqual({
+  it("derives the drawing plane from the main camera quaternion", () => {
+    expect(cameraDrawingView(START.quaternion)).toEqual({
       right: [1, 0, 0],
+      up: [0, 1, 0],
       forward: [0, 0, -1],
     });
   });
 
   it("ignores a trajectory with only one point", () => {
-    expect(cameraViewsFromTrajectory([[0, 1, 0]], START, [0, 0, 0])).toEqual([]);
+    expect(cameraViewsFromTrajectory([[0, 1, 0]], START)).toEqual([]);
   });
 });

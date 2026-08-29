@@ -12,17 +12,40 @@ export type CameraView = {
 export type SampledCameraView = Omit<CameraView, "id">;
 export type DrawPoint = [number, number];
 export type TrajectoryPoint = [number, number, number];
-export type TrajectoryProjection = "top" | "front" | "side";
+export type TrajectoryDrawingView = {
+  right: TrajectoryPoint;
+  up: TrajectoryPoint;
+  forward: TrajectoryPoint;
+};
+export type TrajectorySegment = {
+  id: string;
+  points: TrajectoryPoint[];
+};
 export type TrajectorySpace = {
   center: TrajectoryPoint;
-  right: TrajectoryPoint;
-  forward: TrajectoryPoint;
-  horizontalRadius: number;
-  maximumHeight: number;
+  radius: number;
 };
 
 export const TRAJECTORY_FLOOR_Y = 0;
-export const TRAJECTORY_FLOOR_SCREEN_Y = 0.86;
+
+export function trajectoryPathFromSegments(
+  segments: readonly TrajectorySegment[],
+): TrajectoryPoint[] {
+  const path: TrajectoryPoint[] = [];
+  for (const segment of segments) {
+    for (const point of segment.points) {
+      const previous = path.at(-1);
+      if (
+        !previous ||
+        new THREE.Vector3(...point).distanceTo(new THREE.Vector3(...previous)) >
+          1e-5
+      ) {
+        path.push(point);
+      }
+    }
+  }
+  return path;
+}
 
 export function cameraViewLookingAt(
   id: string,
@@ -61,84 +84,78 @@ export function cameraPathTarget(
   return [groundTarget[0], targetY, groundTarget[2]];
 }
 
-export function cameraMapAxes(reference: CameraView): {
-  right: [number, number, number];
-  forward: [number, number, number];
-} {
-  const quaternion = new THREE.Quaternion(...reference.quaternion);
-  const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(quaternion);
-  forward.y = 0;
-  if (forward.lengthSq() < 1e-5) forward.set(0, 0, -1);
-  forward.normalize();
-  const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0));
-  right.y = 0;
-  right.normalize();
-  return { right: right.toArray(), forward: forward.toArray() };
+export function cameraDrawingView(
+  quaternion: readonly [number, number, number, number],
+): TrajectoryDrawingView {
+  const rotation = new THREE.Quaternion(...quaternion).normalize();
+  return {
+    right: new THREE.Vector3(1, 0, 0).applyQuaternion(rotation).toArray(),
+    up: new THREE.Vector3(0, 1, 0).applyQuaternion(rotation).toArray(),
+    forward: new THREE.Vector3(0, 0, -1).applyQuaternion(rotation).toArray(),
+  };
 }
 
 export function projectTrajectoryPoint(
   point: TrajectoryPoint,
-  projection: TrajectoryProjection,
+  view: TrajectoryDrawingView,
   space: TrajectorySpace,
 ): DrawPoint {
-  const offset = new THREE.Vector3(...point).sub(new THREE.Vector3(...space.center));
-  const rightOffset = offset.dot(new THREE.Vector3(...space.right));
-  const forwardOffset = offset.dot(new THREE.Vector3(...space.forward));
-  if (projection === "top") {
-    return [
-      0.5 + rightOffset / (space.horizontalRadius * 2),
-      0.5 - forwardOffset / (space.horizontalRadius * 2),
-    ];
-  }
-
-  const horizontalOffset = projection === "front" ? rightOffset : forwardOffset;
+  const offset = new THREE.Vector3(...point).sub(
+    new THREE.Vector3(...space.center),
+  );
   return [
-    0.5 + horizontalOffset / (space.horizontalRadius * 2),
-    TRAJECTORY_FLOOR_SCREEN_Y -
-      ((point[1] - TRAJECTORY_FLOOR_Y) / space.maximumHeight) *
-        TRAJECTORY_FLOOR_SCREEN_Y,
+    0.5 + offset.dot(new THREE.Vector3(...view.right)) / (space.radius * 2),
+    0.5 - offset.dot(new THREE.Vector3(...view.up)) / (space.radius * 2),
   ];
 }
 
 export function unprojectTrajectoryPoint(
   point: DrawPoint,
-  projection: TrajectoryProjection,
+  view: TrajectoryDrawingView,
   space: TrajectorySpace,
   anchor: TrajectoryPoint,
 ): TrajectoryPoint {
-  const right = new THREE.Vector3(...space.right);
-  const forward = new THREE.Vector3(...space.forward);
-  const anchorOffset = new THREE.Vector3(...anchor).sub(new THREE.Vector3(...space.center));
-  let rightOffset = anchorOffset.dot(right);
-  let forwardOffset = anchorOffset.dot(forward);
-  let height = Math.max(TRAJECTORY_FLOOR_Y, anchor[1]);
+  const right = new THREE.Vector3(...view.right);
+  const up = new THREE.Vector3(...view.up);
+  const forward = new THREE.Vector3(...view.forward);
+  const anchorOffset = new THREE.Vector3(...anchor).sub(
+    new THREE.Vector3(...space.center),
+  );
+  const position = new THREE.Vector3(...space.center)
+    .addScaledVector(right, (point[0] - 0.5) * space.radius * 2)
+    .addScaledVector(up, (0.5 - point[1]) * space.radius * 2)
+    .addScaledVector(forward, anchorOffset.dot(forward));
+  position.y = Math.max(TRAJECTORY_FLOOR_Y, position.y);
+  return position.toArray();
+}
 
-  if (projection === "top") {
-    rightOffset = (point[0] - 0.5) * space.horizontalRadius * 2;
-    forwardOffset = (0.5 - point[1]) * space.horizontalRadius * 2;
-  } else {
-    const horizontalOffset = (point[0] - 0.5) * space.horizontalRadius * 2;
-    height = Math.max(
-      TRAJECTORY_FLOOR_Y,
-      TRAJECTORY_FLOOR_Y +
-        ((TRAJECTORY_FLOOR_SCREEN_Y - point[1]) /
-          TRAJECTORY_FLOOR_SCREEN_Y) *
-          space.maximumHeight,
-    );
-    if (projection === "front") rightOffset = horizontalOffset;
-    else forwardOffset = horizontalOffset;
-  }
+export function trajectoryFloorBoundary(
+  view: TrajectoryDrawingView,
+  space: TrajectorySpace,
+  anchor: TrajectoryPoint,
+): [DrawPoint, DrawPoint] | null {
+  if (Math.abs(view.up[1]) < 1e-4) return null;
 
-  return new THREE.Vector3(space.center[0], height, space.center[2])
-    .addScaledVector(right, rightOffset)
-    .addScaledVector(forward, forwardOffset)
-    .toArray();
+  const center = new THREE.Vector3(...space.center);
+  const forward = new THREE.Vector3(...view.forward);
+  const depth = new THREE.Vector3(...anchor).sub(center).dot(forward);
+  const boundaryPoint = (x: number): DrawPoint => {
+    const rightOffset = (x - 0.5) * space.radius * 2;
+    const upOffset =
+      -(
+        space.center[1] +
+        view.right[1] * rightOffset +
+        view.forward[1] * depth
+      ) / view.up[1];
+    return [x, 0.5 - upOffset / (space.radius * 2)];
+  };
+  return [boundaryPoint(0), boundaryPoint(1)];
 }
 
 export function appendDrawnTrajectory(
   existing: readonly TrajectoryPoint[],
   stroke: readonly DrawPoint[],
-  projection: TrajectoryProjection,
+  view: TrajectoryDrawingView,
   space: TrajectorySpace,
   referencePosition: TrajectoryPoint,
 ): TrajectoryPoint[] {
@@ -146,13 +163,14 @@ export function appendDrawnTrajectory(
   const anchor = existing.at(-1) ?? referencePosition;
   const newPoints = stroke
     .slice(existing.length > 0 ? 1 : 0)
-    .map((point) => unprojectTrajectoryPoint(point, projection, space, anchor));
+    .map((point) => unprojectTrajectoryPoint(point, view, space, anchor));
   const path = [...existing];
   for (const point of newPoints) {
     const previous = path.at(-1);
     if (
       !previous ||
-      new THREE.Vector3(...point).distanceTo(new THREE.Vector3(...previous)) > 1e-5
+      new THREE.Vector3(...point).distanceTo(new THREE.Vector3(...previous)) >
+        1e-5
     ) {
       path.push(point);
     }
@@ -163,11 +181,8 @@ export function appendDrawnTrajectory(
 export function cameraViewsFromTrajectory(
   path: readonly TrajectoryPoint[],
   reference: CameraView,
-  groundTarget: [number, number, number],
 ): CameraView[] {
   if (path.length < 2) return [];
-
-  const target = cameraPathTarget(reference, groundTarget);
 
   return path.map((point, index) => {
     const position: TrajectoryPoint = [
@@ -175,16 +190,27 @@ export function cameraViewsFromTrajectory(
       Math.max(TRAJECTORY_FLOOR_Y, point[1]),
       point[2],
     ];
+    const previous = new THREE.Vector3(...path[Math.max(0, index - 1)]!);
+    const next = new THREE.Vector3(
+      ...path[Math.min(path.length - 1, index + 1)]!,
+    );
+    const direction = next.sub(previous);
+    if (direction.lengthSq() < 1e-8) {
+      direction
+        .set(0, 0, -1)
+        .applyQuaternion(new THREE.Quaternion(...reference.quaternion));
+    }
+    const target = new THREE.Vector3(...position).add(direction);
     return cameraViewLookingAt(
       `drawn-frame-${index + 1}`,
       position,
-      target,
+      target.toArray(),
       reference.fovRadians,
     );
   });
 }
 
-/** Sample a smooth path that preserves each captured camera's orientation. */
+/** Sample a smooth path with each moving camera facing along the spline. */
 export function sampleCameraPath(
   views: readonly CameraView[],
   frameCount: number,
@@ -197,39 +223,45 @@ export function sampleCameraPath(
     "centripetal",
   );
   const hasMovement = curve.getLength() > 1e-5;
-  const quaternions = views.map((view) => new THREE.Quaternion(...view.quaternion).normalize());
+  const quaternions = views.map((view) =>
+    new THREE.Quaternion(...view.quaternion).normalize(),
+  );
   const segmentCount = views.length - 1;
+  let previousQuaternion = quaternions[0]!.clone();
 
   return Array.from({ length: frameCount }, (_, index) => {
-    if (index === 0 || frameCount === 1) {
-      const start = views[0]!;
-      return {
-        position: floorSafePosition(start.position),
-        quaternion: [...start.quaternion],
-        fovRadians: start.fovRadians,
-      };
-    }
-    if (index === frameCount - 1) {
-      const end = views.at(-1)!;
-      return {
-        position: floorSafePosition(end.position),
-        quaternion: [...end.quaternion],
-        fovRadians: end.fovRadians,
-      };
-    }
-
-    const progress = index / (frameCount - 1);
-    const curveProgress = hasMovement ? curve.getUtoTmapping(progress, 0) : progress;
-    const position = curve.getPoint(curveProgress);
-    position.y = Math.max(TRAJECTORY_FLOOR_Y, position.y);
+    const progress = frameCount === 1 ? 0 : index / (frameCount - 1);
+    const curveProgress = hasMovement
+      ? curve.getUtoTmapping(progress, 0)
+      : progress;
+    const position =
+      index === 0
+        ? new THREE.Vector3(...floorSafePosition(views[0]!.position))
+        : index === frameCount - 1
+          ? new THREE.Vector3(...floorSafePosition(views.at(-1)!.position))
+          : floorSafeCurvePoint(curve, curveProgress);
     const viewProgress = curveProgress * segmentCount;
     const segment = Math.min(Math.floor(viewProgress), segmentCount - 1);
     const amount = THREE.MathUtils.clamp(viewProgress - segment, 0, 1);
-    const quaternion = new THREE.Quaternion().slerpQuaternions(
-      quaternions[segment]!,
-      quaternions[segment + 1]!,
-      amount,
-    );
+    const quaternion = hasMovement
+      ? quaternionFacingDirection(
+          floorSafeCurveDirection(curve, curveProgress),
+          previousQuaternion,
+        )
+      : new THREE.Quaternion().slerpQuaternions(
+          quaternions[segment]!,
+          quaternions[segment + 1]!,
+          amount,
+        );
+    if (previousQuaternion.dot(quaternion) < 0) {
+      quaternion.set(
+        -quaternion.x,
+        -quaternion.y,
+        -quaternion.z,
+        -quaternion.w,
+      );
+    }
+    previousQuaternion = quaternion;
     const fovRadians = THREE.MathUtils.lerp(
       views[segment]!.fovRadians,
       views[segment + 1]!.fovRadians,
@@ -244,14 +276,63 @@ export function sampleCameraPath(
   });
 }
 
+function floorSafeCurvePoint(
+  curve: THREE.CatmullRomCurve3,
+  progress: number,
+): THREE.Vector3 {
+  const point = curve.getPoint(progress);
+  point.y = Math.max(TRAJECTORY_FLOOR_Y, point.y);
+  return point;
+}
+
+function floorSafeCurveDirection(
+  curve: THREE.CatmullRomCurve3,
+  progress: number,
+): THREE.Vector3 {
+  const delta = 1e-3;
+  const before = floorSafeCurvePoint(curve, Math.max(0, progress - delta));
+  const after = floorSafeCurvePoint(curve, Math.min(1, progress + delta));
+  const direction = after.sub(before);
+  return direction.lengthSq() > 1e-10
+    ? direction.normalize()
+    : curve.getTangent(progress).normalize();
+}
+
+function quaternionFacingDirection(
+  direction: THREE.Vector3,
+  previous: THREE.Quaternion,
+): THREE.Quaternion {
+  if (direction.lengthSq() < 1e-10) return previous.clone();
+  const forward = direction.clone().normalize();
+  const previousUp = new THREE.Vector3(0, 1, 0).applyQuaternion(previous);
+  const up = previousUp.addScaledVector(forward, -previousUp.dot(forward));
+  if (up.lengthSq() < 1e-8) {
+    const previousRight = new THREE.Vector3(1, 0, 0).applyQuaternion(previous);
+    up.crossVectors(previousRight, forward);
+  }
+  if (up.lengthSq() < 1e-8) {
+    up.set(
+      0,
+      Math.abs(forward.y) < 0.99 ? 1 : 0,
+      Math.abs(forward.y) < 0.99 ? 0 : 1,
+    );
+    up.addScaledVector(forward, -up.dot(forward));
+  }
+  up.normalize();
+  const right = new THREE.Vector3().crossVectors(forward, up).normalize();
+  up.crossVectors(right, forward).normalize();
+  const rotation = new THREE.Matrix4().makeBasis(
+    right,
+    up,
+    forward.clone().negate(),
+  );
+  return new THREE.Quaternion().setFromRotationMatrix(rotation).normalize();
+}
+
 function floorSafePosition(
   position: readonly [number, number, number],
 ): TrajectoryPoint {
-  return [
-    position[0],
-    Math.max(TRAJECTORY_FLOOR_Y, position[1]),
-    position[2],
-  ];
+  return [position[0], Math.max(TRAJECTORY_FLOOR_Y, position[1]), position[2]];
 }
 
 export function buildTargetCameras(
