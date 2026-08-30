@@ -7,6 +7,8 @@ import {
   cameraPathTarget,
   cameraViewLookingAt,
   cameraViewsFromTrajectory,
+  insertTrajectoryPivot,
+  MAX_PIVOTS_PER_PART,
   moveTrajectoryPoint,
   projectTrajectoryPoint,
   sampleCameraPath,
@@ -95,29 +97,41 @@ describe("sampleCameraPath", () => {
         new THREE.Quaternion(...samples[index]!.quaternion),
       );
       expect(cameraForward.dot(pathForward)).toBeGreaterThan(0.995);
+      if (index > 0) {
+        const previousQuaternion = new THREE.Quaternion(
+          ...samples[index - 1]!.quaternion,
+        );
+        expect(
+          previousQuaternion.dot(
+            new THREE.Quaternion(...samples[index]!.quaternion),
+          ),
+        ).toBeGreaterThanOrEqual(0);
+      }
     }
   });
 
-  it("keeps every sampled camera aimed at a shared subject", () => {
-    const subject: [number, number, number] = [2, 1, -1];
+  it("keeps the camera upright while following a 3D curve", () => {
     const views = cameraViewsFromTrajectory(
       [
         [-4, 2, 3],
-        [0, 4, 5],
-        [6, 3, 2],
+        [0, 4, -1],
+        [6, 3, -5],
       ],
       START,
     );
-    const samples = sampleCameraPath(views, 51, subject);
+    const samples = sampleCameraPath(views, 51);
 
     for (const sample of samples) {
-      const expectedForward = new THREE.Vector3(...subject)
-        .sub(new THREE.Vector3(...sample.position))
-        .normalize();
       const cameraForward = new THREE.Vector3(0, 0, -1).applyQuaternion(
         new THREE.Quaternion(...sample.quaternion),
       );
-      expect(cameraForward.dot(expectedForward)).toBeGreaterThan(0.999);
+      const expectedUp = new THREE.Vector3(0, 1, 0)
+        .addScaledVector(cameraForward, -cameraForward.y)
+        .normalize();
+      const cameraUp = new THREE.Vector3(0, 1, 0).applyQuaternion(
+        new THREE.Quaternion(...sample.quaternion),
+      );
+      expect(cameraUp.dot(expectedUp)).toBeGreaterThan(0.999);
     }
   });
 });
@@ -129,6 +143,20 @@ describe("buildTargetCameras", () => {
     expect(cameras[0]?.intrinsics).toMatchObject({ width: 1280, height: 720 });
     expect(cameras[0]?.extrinsics.coordinateSystem).toBe("rub");
     expect(cameras[1]?.extrinsics.position).toEqual(END.position);
+  });
+
+  it("faces generated cameras forward along the path", () => {
+    const cameras = buildTargetCameras([START, END], 9, 1280, 720);
+    const expectedForward = new THREE.Vector3(...END.position)
+      .sub(new THREE.Vector3(...START.position))
+      .normalize();
+
+    for (const camera of cameras) {
+      const cameraForward = new THREE.Vector3(0, 0, -1).applyQuaternion(
+        new THREE.Quaternion(...camera.extrinsics.quaternion),
+      );
+      expect(cameraForward.dot(expectedForward)).toBeGreaterThan(0.999);
+    }
   });
 });
 
@@ -173,6 +201,47 @@ const TURNED_VIEW = cameraDrawingView(
 );
 
 describe("3D drawn camera paths", () => {
+  it("inserts a draggable pivot into the nearest path span", () => {
+    const parts = [
+      {
+        id: "one",
+        points: [
+          [0, 1, 0],
+          [10, 1, 0],
+        ],
+      },
+      {
+        id: "two",
+        points: [
+          [10, 1, 0],
+          [20, 1, 0],
+        ],
+      },
+    ] satisfies { id: string; points: [number, number, number][] }[];
+
+    const inserted = insertTrajectoryPivot(parts, [7, 3, 1], 0.35);
+
+    expect(inserted).toMatchObject({ segmentId: "one", pointIndex: 1 });
+    expect(inserted?.segments[0]?.points).toEqual([
+      [0, 1, 0],
+      [7, 3, 1],
+      [10, 1, 0],
+    ]);
+    expect(inserted?.segments[1]).toBe(parts[1]);
+    expect(parts[0]?.points).toHaveLength(2);
+  });
+
+  it("does not add more than the manual pivot limit", () => {
+    const points = Array.from(
+      { length: MAX_PIVOTS_PER_PART },
+      (_, index): [number, number, number] => [index, 1, 0],
+    );
+
+    expect(
+      insertTrajectoryPivot([{ id: "one", points }], [4.5, 2, 0], 0.5),
+    ).toBeNull();
+  });
+
   it("moves a shared part endpoint without splitting the path", () => {
     const parts = [
       {
