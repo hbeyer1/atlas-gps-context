@@ -3,9 +3,11 @@ import * as THREE from "three";
 import {
   appendDrawnTrajectory,
   buildTargetCameras,
+  cameraAimDegrees,
   cameraDrawingView,
   cameraPathTarget,
   cameraQuaternionAtView,
+  cameraQuaternionFromAim,
   cameraViewLookingAt,
   cameraViewsFromSegments,
   cameraViewsFromTrajectory,
@@ -13,11 +15,12 @@ import {
   MAX_PIVOTS_PER_PART,
   moveTrajectoryPoint,
   projectTrajectoryPoint,
-  rotateCameraQuaternion,
+  projectCameraPreviewPoints,
   sampleCameraPath,
   setTrajectoryPointQuaternion,
   trajectoryFloorBoundary,
   trajectoryPathFromSegments,
+  trajectoryPivotsFromSegments,
   unprojectTrajectoryPoint,
   type CameraView,
   type TrajectorySegment,
@@ -182,6 +185,38 @@ describe("click-to-place camera points", () => {
   });
 });
 
+describe("camera direction preview", () => {
+  it("projects points through the selected camera", () => {
+    const projected = projectCameraPreviewPoints(
+      [
+        [0, 0, -2],
+        [1, 1, -2],
+        [0, 0, 2],
+      ],
+      { ...START, position: [0, 0, 0] },
+    );
+
+    expect(projected).toHaveLength(2);
+    expect(projected[0]).toEqual({ x: 0.5, y: 0.5, depth: 2 });
+    expect(projected[1]!.x).toBeGreaterThan(0.5);
+    expect(projected[1]!.y).toBeLessThan(0.5);
+  });
+
+  it("shows the world direction chosen by yaw", () => {
+    const projected = projectCameraPreviewPoints(
+      [[2, 0, 0]],
+      {
+        ...START,
+        position: [0, 0, 0],
+        quaternion: cameraQuaternionFromAim(90, 0),
+      },
+    );
+
+    expect(projected[0]?.x).toBeCloseTo(0.5);
+    expect(projected[0]?.y).toBeCloseTo(0.5);
+  });
+});
+
 const SPACE: TrajectorySpace = {
   center: [0, 0, 0],
   radius: 10,
@@ -278,6 +313,34 @@ describe("3D drawn camera paths", () => {
     expect(parts[0]?.points.at(-1)).toEqual([1, 1, 0]);
   });
 
+  it("numbers shared pivots once for the viewer and camera picker", () => {
+    const pivots = trajectoryPivotsFromSegments([
+      {
+        id: "one",
+        points: [
+          [0, 1, 0],
+          [1, 1, 0],
+        ],
+      },
+      {
+        id: "two",
+        points: [
+          [1, 1, 0],
+          [2, 1, 0],
+        ],
+        quaternions: [[0, 0, 0, 1], null],
+      },
+    ]);
+
+    expect(pivots.map((pivot) => pivot.pivotNumber)).toEqual([1, 2, 3]);
+    expect(pivots[1]).toMatchObject({
+      segmentId: "one",
+      pointIndex: 1,
+      position: [1, 1, 0],
+      hasCameraAngle: true,
+    });
+  });
+
   it("sets the same manual angle on both copies of a shared pivot", () => {
     const parts: TrajectorySegment[] = [
       {
@@ -369,27 +432,29 @@ describe("3D drawn camera paths", () => {
     ).toBeCloseTo(Math.PI / 4);
   });
 
-  it("turns right on horizontal camera drag without adding roll", () => {
-    const rotated = new THREE.Quaternion(
-      ...rotateCameraQuaternion([0, 0, 0, 1], 100, 0),
-    );
+  it("uses positive yaw to look right without adding roll", () => {
+    const quaternion = cameraQuaternionFromAim(45, 0);
+    const rotated = new THREE.Quaternion(...quaternion);
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(rotated);
     const right = new THREE.Vector3(1, 0, 0).applyQuaternion(rotated);
 
-    expect(forward.x).toBeGreaterThan(0.45);
+    expect(forward.x).toBeCloseTo(Math.SQRT1_2);
     expect(right.y).toBeCloseTo(0);
+    const aim = cameraAimDegrees(quaternion);
+    expect(aim.yaw).toBeCloseTo(45);
+    expect(aim.pitch).toBeCloseTo(0);
   });
 
-  it("clamps vertical camera drag before it flips", () => {
-    const rotated = new THREE.Quaternion(
-      ...rotateCameraQuaternion([0, 0, 0, 1], 0, 10_000),
-    );
+  it("clamps pitch before the camera flips", () => {
+    const quaternion = cameraQuaternionFromAim(0, 10_000);
+    const rotated = new THREE.Quaternion(...quaternion);
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(rotated);
     const right = new THREE.Vector3(1, 0, 0).applyQuaternion(rotated);
 
-    expect(forward.y).toBeLessThan(-0.999);
+    expect(forward.y).toBeGreaterThan(0.999);
     expect(forward.z).toBeLessThan(0);
     expect(right.y).toBeCloseTo(0);
+    expect(cameraAimDegrees(quaternion).pitch).toBeCloseTo(89);
   });
 
   it("holds one manual angle across the full path", () => {

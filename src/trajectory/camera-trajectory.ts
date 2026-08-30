@@ -24,6 +24,13 @@ export type TrajectorySegment = {
   points: TrajectoryPoint[];
   quaternions?: (TrajectoryQuaternion | null)[] | null;
 };
+export type TrajectoryPivot = {
+  segmentId: string;
+  pointIndex: number;
+  pivotNumber: number;
+  position: TrajectoryPoint;
+  hasCameraAngle: boolean;
+};
 export type TrajectorySpace = {
   center: TrajectoryPoint;
   radius: number;
@@ -38,6 +45,18 @@ export function trajectoryPathFromSegments(
   segments: readonly TrajectorySegment[],
 ): TrajectoryPoint[] {
   return trajectoryPathEntries(segments).map((entry) => entry.point);
+}
+
+export function trajectoryPivotsFromSegments(
+  segments: readonly TrajectorySegment[],
+): TrajectoryPivot[] {
+  return trajectoryPathEntries(segments).map((entry, index) => ({
+    segmentId: segments[entry.segmentIndex]!.id,
+    pointIndex: entry.pointIndex,
+    pivotNumber: index + 1,
+    position: entry.point,
+    hasCameraAngle: Boolean(entry.quaternion),
+  }));
 }
 
 type TrajectoryPathEntry = {
@@ -450,23 +469,64 @@ export function cameraQuaternionAtView(
   ).toArray();
 }
 
-export function rotateCameraQuaternion(
-  quaternion: TrajectoryQuaternion,
-  horizontalPixels: number,
-  verticalPixels: number,
-): TrajectoryQuaternion {
+export function cameraAimDegrees(quaternion: TrajectoryQuaternion): {
+  yaw: number;
+  pitch: number;
+} {
   const euler = new THREE.Euler().setFromQuaternion(
     new THREE.Quaternion(...quaternion).normalize(),
     "YXZ",
   );
-  euler.y -= horizontalPixels * 0.005;
-  euler.x = THREE.MathUtils.clamp(
-    euler.x - verticalPixels * 0.005,
-    -Math.PI / 2 + 0.01,
-    Math.PI / 2 - 0.01,
-  );
-  euler.z = 0;
-  return new THREE.Quaternion().setFromEuler(euler).normalize().toArray();
+  return {
+    yaw: THREE.MathUtils.euclideanModulo(
+      -THREE.MathUtils.radToDeg(euler.y) + 180,
+      360,
+    ) - 180,
+    pitch: THREE.MathUtils.radToDeg(euler.x),
+  };
+}
+
+export function cameraQuaternionFromAim(
+  yaw: number,
+  pitch: number,
+): TrajectoryQuaternion {
+  return new THREE.Quaternion()
+    .setFromEuler(
+      new THREE.Euler(
+        THREE.MathUtils.degToRad(THREE.MathUtils.clamp(pitch, -89, 89)),
+        THREE.MathUtils.degToRad(-yaw),
+        0,
+        "YXZ",
+      ),
+    )
+    .normalize()
+    .toArray();
+}
+
+export function projectCameraPreviewPoints(
+  points: readonly TrajectoryPoint[],
+  view: CameraView,
+  aspectRatio = 16 / 9,
+): { x: number; y: number; depth: number }[] {
+  const cameraPosition = new THREE.Vector3(...view.position);
+  const worldToCamera = new THREE.Quaternion(...view.quaternion)
+    .normalize()
+    .invert();
+  const halfHeightAtUnitDepth = Math.tan(view.fovRadians / 2);
+  const local = new THREE.Vector3();
+  const projected: { x: number; y: number; depth: number }[] = [];
+
+  for (const point of points) {
+    local.set(...point).sub(cameraPosition).applyQuaternion(worldToCamera);
+    const depth = -local.z;
+    if (depth <= 0.01) continue;
+    const x =
+      0.5 + local.x / (2 * depth * halfHeightAtUnitDepth * aspectRatio);
+    const y = 0.5 - local.y / (2 * depth * halfHeightAtUnitDepth);
+    if (x < 0 || x > 1 || y < 0 || y > 1) continue;
+    projected.push({ x, y, depth });
+  }
+  return projected;
 }
 
 /** Sample a smooth path using the manually chosen camera angles. */
