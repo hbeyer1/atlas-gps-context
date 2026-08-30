@@ -5,7 +5,7 @@ import {
   buildTargetCameras,
   cameraDrawingView,
   cameraPathTarget,
-  cameraQuaternionFromDrawingView,
+  cameraQuaternionAtView,
   cameraViewLookingAt,
   cameraViewsFromSegments,
   cameraViewsFromTrajectory,
@@ -13,6 +13,7 @@ import {
   MAX_PIVOTS_PER_PART,
   moveTrajectoryPoint,
   projectTrajectoryPoint,
+  rotateCameraQuaternion,
   sampleCameraPath,
   setTrajectoryPointQuaternion,
   trajectoryFloorBoundary,
@@ -341,6 +342,56 @@ describe("3D drawn camera paths", () => {
     expect(samples[2]?.quaternion).toEqual(left);
   });
 
+  it("starts an unset pivot camera at its interpolated angle", () => {
+    const forward: [number, number, number, number] = [0, 0, 0, 1];
+    const left = new THREE.Quaternion()
+      .setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2)
+      .toArray();
+    const views = cameraViewsFromSegments(
+      [
+        {
+          id: "one",
+          points: [
+            [0, 1, 0],
+            [1, 1, 0],
+            [2, 1, 0],
+          ],
+          quaternions: [forward, null, left],
+        },
+      ],
+      START,
+    );
+
+    expect(
+      new THREE.Quaternion(...cameraQuaternionAtView(views, 1)).angleTo(
+        new THREE.Quaternion(...forward),
+      ),
+    ).toBeCloseTo(Math.PI / 4);
+  });
+
+  it("turns right on horizontal camera drag without adding roll", () => {
+    const rotated = new THREE.Quaternion(
+      ...rotateCameraQuaternion([0, 0, 0, 1], 100, 0),
+    );
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(rotated);
+    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(rotated);
+
+    expect(forward.x).toBeGreaterThan(0.45);
+    expect(right.y).toBeCloseTo(0);
+  });
+
+  it("clamps vertical camera drag before it flips", () => {
+    const rotated = new THREE.Quaternion(
+      ...rotateCameraQuaternion([0, 0, 0, 1], 0, 10_000),
+    );
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(rotated);
+    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(rotated);
+
+    expect(forward.y).toBeLessThan(-0.999);
+    expect(forward.z).toBeLessThan(0);
+    expect(right.y).toBeCloseTo(0);
+  });
+
   it("holds one manual angle across the full path", () => {
     const angle = new THREE.Quaternion()
       .setFromEuler(new THREE.Euler(-0.3, 1.1, 0))
@@ -637,13 +688,6 @@ describe("3D drawn camera paths", () => {
       up: [0, 1, 0],
       forward: [0, 0, -1],
     });
-    expect(
-      Math.abs(
-        new THREE.Quaternion(
-          ...cameraQuaternionFromDrawingView(drawingView),
-        ).dot(new THREE.Quaternion(...START.quaternion)),
-      ),
-    ).toBeCloseTo(1);
   });
 
   it("ignores a trajectory with only one point", () => {

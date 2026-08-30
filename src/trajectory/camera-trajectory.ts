@@ -428,15 +428,45 @@ export function cameraViewsFromSegments(
   }));
 }
 
-export function cameraQuaternionFromDrawingView(
-  view: TrajectoryDrawingView,
+export function cameraQuaternionAtView(
+  views: readonly CameraView[],
+  viewIndex: number,
 ): TrajectoryQuaternion {
-  const rotation = new THREE.Matrix4().makeBasis(
-    new THREE.Vector3(...view.right),
-    new THREE.Vector3(...view.up),
-    new THREE.Vector3(...view.forward).negate(),
+  if (views.length === 0) return [0, 0, 0, 1];
+  if (views.length === 1) return views[0]!.quaternion;
+
+  const curve = new THREE.CatmullRomCurve3(
+    views.map((view) => new THREE.Vector3(...floorSafePosition(view.position))),
+    false,
+    "centripetal",
   );
-  return new THREE.Quaternion().setFromRotationMatrix(rotation).toArray();
+  const arcLengths = curve.getLength() > 1e-5 ? curve.getLengths() : [];
+  const { quaternions, progresses } = cameraOrientationKeys(views, arcLengths);
+  const index = THREE.MathUtils.clamp(viewIndex, 0, views.length - 1);
+  return quaternionAtProgress(
+    quaternions,
+    progresses,
+    curveProgressAtView(index, views.length, arcLengths),
+  ).toArray();
+}
+
+export function rotateCameraQuaternion(
+  quaternion: TrajectoryQuaternion,
+  horizontalPixels: number,
+  verticalPixels: number,
+): TrajectoryQuaternion {
+  const euler = new THREE.Euler().setFromQuaternion(
+    new THREE.Quaternion(...quaternion).normalize(),
+    "YXZ",
+  );
+  euler.y -= horizontalPixels * 0.005;
+  euler.x = THREE.MathUtils.clamp(
+    euler.x - verticalPixels * 0.005,
+    -Math.PI / 2 + 0.01,
+    Math.PI / 2 - 0.01,
+  );
+  euler.z = 0;
+  return new THREE.Quaternion().setFromEuler(euler).normalize().toArray();
 }
 
 /** Sample a smooth path using the manually chosen camera angles. */
@@ -452,27 +482,8 @@ export function sampleCameraPath(
     "centripetal",
   );
   const hasMovement = curve.getLength() > 1e-5;
-  const explicitKeyIndices = views.flatMap((view, index) =>
-    view.angleKey ? [index] : [],
-  );
-  const keyIndices =
-    explicitKeyIndices.length > 0
-      ? explicitKeyIndices
-      : views.map((_, index) => index);
-  const quaternions = keyIndices.map((index) =>
-    new THREE.Quaternion(...views[index]!.quaternion).normalize(),
-  );
-  for (let index = 1; index < quaternions.length; index += 1) {
-    const previous = quaternions[index - 1]!;
-    const current = quaternions[index]!;
-    if (previous.dot(current) < 0) {
-      current.set(-current.x, -current.y, -current.z, -current.w);
-    }
-  }
   const arcLengths = hasMovement ? curve.getLengths() : [];
-  const keyProgresses = keyIndices.map((index) =>
-    curveProgressAtView(index, views.length, arcLengths),
-  );
+  const { quaternions, progresses } = cameraOrientationKeys(views, arcLengths);
   const segmentCount = views.length - 1;
   let previousQuaternion = quaternions[0]!.clone();
 
@@ -490,11 +501,7 @@ export function sampleCameraPath(
     const viewProgress = curveProgress * segmentCount;
     const segment = Math.min(Math.floor(viewProgress), segmentCount - 1);
     const amount = THREE.MathUtils.clamp(viewProgress - segment, 0, 1);
-    const quaternion = quaternionAtProgress(
-      quaternions,
-      keyProgresses,
-      progress,
-    );
+    const quaternion = quaternionAtProgress(quaternions, progresses, progress);
     if (previousQuaternion.dot(quaternion) < 0) {
       quaternion.set(
         -quaternion.x,
@@ -516,6 +523,35 @@ export function sampleCameraPath(
       fovRadians,
     };
   });
+}
+
+function cameraOrientationKeys(
+  views: readonly CameraView[],
+  arcLengths: readonly number[],
+): { quaternions: THREE.Quaternion[]; progresses: number[] } {
+  const explicitKeyIndices = views.flatMap((view, index) =>
+    view.angleKey ? [index] : [],
+  );
+  const keyIndices =
+    explicitKeyIndices.length > 0
+      ? explicitKeyIndices
+      : views.map((_, index) => index);
+  const quaternions = keyIndices.map((index) =>
+    new THREE.Quaternion(...views[index]!.quaternion).normalize(),
+  );
+  for (let index = 1; index < quaternions.length; index += 1) {
+    const previous = quaternions[index - 1]!;
+    const current = quaternions[index]!;
+    if (previous.dot(current) < 0) {
+      current.set(-current.x, -current.y, -current.z, -current.w);
+    }
+  }
+  return {
+    quaternions,
+    progresses: keyIndices.map((index) =>
+      curveProgressAtView(index, views.length, arcLengths),
+    ),
+  };
 }
 
 function curveProgressAtView(
