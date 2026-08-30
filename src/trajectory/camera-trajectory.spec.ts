@@ -97,6 +97,29 @@ describe("sampleCameraPath", () => {
       expect(cameraForward.dot(pathForward)).toBeGreaterThan(0.995);
     }
   });
+
+  it("keeps every sampled camera aimed at a shared subject", () => {
+    const subject: [number, number, number] = [2, 1, -1];
+    const views = cameraViewsFromTrajectory(
+      [
+        [-4, 2, 3],
+        [0, 4, 5],
+        [6, 3, 2],
+      ],
+      START,
+    );
+    const samples = sampleCameraPath(views, 51, subject);
+
+    for (const sample of samples) {
+      const expectedForward = new THREE.Vector3(...subject)
+        .sub(new THREE.Vector3(...sample.position))
+        .normalize();
+      const cameraForward = new THREE.Vector3(0, 0, -1).applyQuaternion(
+        new THREE.Quaternion(...sample.quaternion),
+      );
+      expect(cameraForward.dot(expectedForward)).toBeGreaterThan(0.999);
+    }
+  });
 });
 
 describe("buildTargetCameras", () => {

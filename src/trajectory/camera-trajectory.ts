@@ -294,10 +294,11 @@ export function cameraViewsFromTrajectory(
   });
 }
 
-/** Sample a smooth path with each moving camera facing along the spline. */
+/** Sample a smooth path, optionally keeping each camera aimed at one target. */
 export function sampleCameraPath(
   views: readonly CameraView[],
   frameCount: number,
+  lookTarget?: TrajectoryPoint,
 ): SampledCameraView[] {
   if (views.length < 2 || frameCount < 1) return [];
 
@@ -327,16 +328,21 @@ export function sampleCameraPath(
     const viewProgress = curveProgress * segmentCount;
     const segment = Math.min(Math.floor(viewProgress), segmentCount - 1);
     const amount = THREE.MathUtils.clamp(viewProgress - segment, 0, 1);
-    const quaternion = hasMovement
-      ? quaternionFacingDirection(
-          floorSafeCurveDirection(curve, curveProgress),
-          previousQuaternion,
-        )
-      : new THREE.Quaternion().slerpQuaternions(
-          quaternions[segment]!,
-          quaternions[segment + 1]!,
-          amount,
-        );
+    const lookDirection = lookTarget
+      ? new THREE.Vector3(...lookTarget).sub(position)
+      : null;
+    const quaternion = lookDirection
+      ? quaternionFacingDirection(lookDirection, previousQuaternion)
+      : hasMovement
+        ? quaternionFacingDirection(
+            floorSafeCurveDirection(curve, curveProgress),
+            previousQuaternion,
+          )
+        : new THREE.Quaternion().slerpQuaternions(
+            quaternions[segment]!,
+            quaternions[segment + 1]!,
+            amount,
+          );
     if (previousQuaternion.dot(quaternion) < 0) {
       quaternion.set(
         -quaternion.x,
@@ -424,8 +430,9 @@ export function buildTargetCameras(
   frameCount: number,
   width: number,
   height: number,
+  lookTarget?: TrajectoryPoint,
 ): PinholeCamera[] {
-  return sampleCameraPath(views, frameCount).map((view) => ({
+  return sampleCameraPath(views, frameCount, lookTarget).map((view) => ({
     intrinsics: createIntrinsicsFromFov(
       THREE.MathUtils.radToDeg(view.fovRadians),
       width,
