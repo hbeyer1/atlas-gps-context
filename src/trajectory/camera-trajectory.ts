@@ -545,6 +545,11 @@ export function sampleCameraPath(
   const arcLengths = hasMovement ? curve.getLengths() : [];
   const { quaternions, progresses } = cameraOrientationKeys(views, arcLengths);
   const segmentCount = views.length - 1;
+  const constantFovRadians = views.every(
+    (view) => view.fovRadians === views[0]!.fovRadians,
+  )
+    ? views[0]!.fovRadians
+    : null;
   let previousQuaternion = quaternions[0]!.clone();
 
   return Array.from({ length: frameCount }, (_, index) => {
@@ -571,11 +576,13 @@ export function sampleCameraPath(
       );
     }
     previousQuaternion = quaternion;
-    const fovRadians = THREE.MathUtils.lerp(
-      views[segment]!.fovRadians,
-      views[segment + 1]!.fovRadians,
-      amount,
-    );
+    const fovRadians =
+      constantFovRadians ??
+      THREE.MathUtils.lerp(
+        views[segment]!.fovRadians,
+        views[segment + 1]!.fovRadians,
+        amount,
+      );
 
     return {
       position: position.toArray(),

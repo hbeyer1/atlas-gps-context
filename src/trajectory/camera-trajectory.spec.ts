@@ -154,6 +154,20 @@ describe("buildTargetCameras", () => {
       ),
     ).toBeCloseTo(1);
   });
+
+  it("uses one field of view for every frame in a trajectory", () => {
+    const pathViews = cameraViewsFromTrajectory(
+      [
+        [0, 1, 4],
+        [2, 2, 1],
+        [4, 2, 0],
+      ],
+      { ...START, fovRadians: THREE.MathUtils.degToRad(95) },
+    );
+    const cameras = buildTargetCameras(pathViews, 17, 1280, 720);
+
+    expect(new Set(cameras.map((camera) => camera.intrinsics.fy)).size).toBe(1);
+  });
 });
 
 describe("click-to-place camera points", () => {
