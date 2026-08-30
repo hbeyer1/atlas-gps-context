@@ -167,7 +167,7 @@ export function setTrajectoryPointQuaternion(
 export function insertTrajectoryPivot(
   segments: readonly TrajectorySegment[],
   position: TrajectoryPoint,
-  pathProgress: number,
+  curveProgress: number,
 ): {
   segments: TrajectorySegment[];
   segmentId: string;
@@ -177,17 +177,9 @@ export function insertTrajectoryPivot(
   const entries = trajectoryPathEntries(segments);
   const path = entries.map((entry) => entry.point);
   if (path.length < 2) return null;
-  const curve = new THREE.CatmullRomCurve3(
-    path.map((point) => new THREE.Vector3(...floorSafePosition(point))),
-    false,
-    "centripetal",
-  );
-  const curveProgress = curve.getUtoTmapping(
-    THREE.MathUtils.clamp(pathProgress, 0, 1),
-    0,
-  );
+  const clampedCurveProgress = THREE.MathUtils.clamp(curveProgress, 0, 1);
   const spanIndex = Math.min(
-    Math.floor(curveProgress * (path.length - 1)),
+    Math.floor(clampedCurveProgress * (path.length - 1)),
     path.length - 2,
   );
   const owner = entries[spanIndex + 1];
@@ -288,6 +280,22 @@ export function cameraDrawingView(
     up: new THREE.Vector3(0, 1, 0).applyQuaternion(rotation).toArray(),
     forward: new THREE.Vector3(0, 0, -1).applyQuaternion(rotation).toArray(),
   };
+}
+
+export function zoomTrajectorySpace(
+  space: TrajectorySpace,
+  zoom: number,
+  anchor: TrajectoryPoint,
+  view: TrajectoryDrawingView,
+): TrajectorySpace {
+  const zoomedSpace: TrajectorySpace = {
+    center: [...space.center],
+    radius: space.radius / zoom,
+  };
+  const [x, y] = projectTrajectoryPoint(anchor, view, zoomedSpace);
+  return x >= 0 && x <= 1 && y >= 0 && y <= 1
+    ? zoomedSpace
+    : { ...zoomedSpace, center: [...anchor] };
 }
 
 export function projectTrajectoryPoint(
@@ -454,18 +462,12 @@ export function cameraQuaternionAtView(
   if (views.length === 0) return [0, 0, 0, 1];
   if (views.length === 1) return views[0]!.quaternion;
 
-  const curve = new THREE.CatmullRomCurve3(
-    views.map((view) => new THREE.Vector3(...floorSafePosition(view.position))),
-    false,
-    "centripetal",
-  );
-  const arcLengths = curve.getLength() > 1e-5 ? curve.getLengths() : [];
-  const { quaternions, progresses } = cameraOrientationKeys(views, arcLengths);
+  const { quaternions, progresses } = cameraOrientationKeys(views);
   const index = THREE.MathUtils.clamp(viewIndex, 0, views.length - 1);
   return quaternionAtProgress(
     quaternions,
     progresses,
-    curveProgressAtView(index, views.length, arcLengths),
+    index / (views.length - 1),
   ).toArray();
 }
 
@@ -541,9 +543,7 @@ export function sampleCameraPath(
     false,
     "centripetal",
   );
-  const hasMovement = curve.getLength() > 1e-5;
-  const arcLengths = hasMovement ? curve.getLengths() : [];
-  const { quaternions, progresses } = cameraOrientationKeys(views, arcLengths);
+  const { quaternions, progresses } = cameraOrientationKeys(views);
   const segmentCount = views.length - 1;
   const constantFovRadians = views.every(
     (view) => view.fovRadians === views[0]!.fovRadians,
@@ -553,10 +553,11 @@ export function sampleCameraPath(
   let previousQuaternion = quaternions[0]!.clone();
 
   return Array.from({ length: frameCount }, (_, index) => {
-    const progress = frameCount === 1 ? 0 : index / (frameCount - 1);
-    const curveProgress = hasMovement
-      ? curve.getUtoTmapping(progress, 0)
-      : progress;
+    const curveProgress = cameraPathProgressAtFrame(
+      index,
+      frameCount,
+      views.length,
+    );
     const position =
       index === 0
         ? new THREE.Vector3(...floorSafePosition(views[0]!.position))
@@ -566,7 +567,11 @@ export function sampleCameraPath(
     const viewProgress = curveProgress * segmentCount;
     const segment = Math.min(Math.floor(viewProgress), segmentCount - 1);
     const amount = THREE.MathUtils.clamp(viewProgress - segment, 0, 1);
-    const quaternion = quaternionAtProgress(quaternions, progresses, progress);
+    const quaternion = quaternionAtProgress(
+      quaternions,
+      progresses,
+      curveProgress,
+    );
     if (previousQuaternion.dot(quaternion) < 0) {
       quaternion.set(
         -quaternion.x,
@@ -592,10 +597,33 @@ export function sampleCameraPath(
   });
 }
 
-function cameraOrientationKeys(
-  views: readonly CameraView[],
-  arcLengths: readonly number[],
-): { quaternions: THREE.Quaternion[]; progresses: number[] } {
+export function cameraPathProgressAtFrame(
+  frameIndex: number,
+  frameCount: number,
+  viewCount: number,
+): number {
+  if (frameCount <= 1 || viewCount <= 1) return 0;
+
+  const lastFrame = frameCount - 1;
+  const index = THREE.MathUtils.clamp(frameIndex, 0, lastFrame);
+  const segmentCount = viewCount - 1;
+  if (lastFrame < segmentCount) return index / lastFrame;
+
+  let segment = 0;
+  let segmentEnd = Math.round(lastFrame / segmentCount);
+  while (segment < segmentCount - 1 && index > segmentEnd) {
+    segment += 1;
+    segmentEnd = Math.round(((segment + 1) * lastFrame) / segmentCount);
+  }
+  const segmentStart = Math.round((segment * lastFrame) / segmentCount);
+  const amount = (index - segmentStart) / (segmentEnd - segmentStart);
+  return (segment + amount) / segmentCount;
+}
+
+function cameraOrientationKeys(views: readonly CameraView[]): {
+  quaternions: THREE.Quaternion[];
+  progresses: number[];
+} {
   const explicitKeyIndices = views.flatMap((view, index) =>
     view.angleKey ? [index] : [],
   );
@@ -615,31 +643,8 @@ function cameraOrientationKeys(
   }
   return {
     quaternions,
-    progresses: keyIndices.map((index) =>
-      curveProgressAtView(index, views.length, arcLengths),
-    ),
+    progresses: keyIndices.map((index) => index / (views.length - 1)),
   };
-}
-
-function curveProgressAtView(
-  viewIndex: number,
-  viewCount: number,
-  arcLengths: readonly number[],
-): number {
-  const parameter = viewIndex / (viewCount - 1);
-  const totalLength = arcLengths.at(-1) ?? 0;
-  if (totalLength <= 1e-8 || arcLengths.length < 2) return parameter;
-
-  const scaledIndex = parameter * (arcLengths.length - 1);
-  const startIndex = Math.floor(scaledIndex);
-  const endIndex = Math.min(startIndex + 1, arcLengths.length - 1);
-  return (
-    THREE.MathUtils.lerp(
-      arcLengths[startIndex]!,
-      arcLengths[endIndex]!,
-      scaledIndex - startIndex,
-    ) / totalLength
-  );
 }
 
 function quaternionAtProgress(

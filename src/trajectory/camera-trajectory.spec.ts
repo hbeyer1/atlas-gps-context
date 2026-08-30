@@ -22,6 +22,7 @@ import {
   trajectoryPathFromSegments,
   trajectoryPivotsFromSegments,
   unprojectTrajectoryPoint,
+  zoomTrajectorySpace,
   type CameraView,
   type TrajectorySegment,
   type TrajectorySpace,
@@ -130,6 +131,46 @@ describe("sampleCameraPath", () => {
         ),
       ).toBeCloseTo(1);
     }
+  });
+
+  it("gives equal time to short and long control-point intervals", () => {
+    const middleQuaternion = new THREE.Quaternion()
+      .setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2)
+      .toArray();
+    const views: CameraView[] = [
+      { ...START, position: [0, 1, 0], angleKey: true },
+      {
+        ...START,
+        id: "middle",
+        position: [1, 1, 0],
+        quaternion: middleQuaternion,
+        angleKey: true,
+      },
+      { ...END, position: [101, 1, 0], angleKey: true },
+    ];
+
+    const samples = sampleCameraPath(views, 5);
+
+    expect(samples[2]?.position).toEqual(views[1]?.position);
+    expect(
+      new THREE.Quaternion(...samples[2]!.quaternion).angleTo(
+        new THREE.Quaternion(...middleQuaternion),
+      ),
+    ).toBeCloseTo(0);
+  });
+
+  it("spreads indivisible leftover frames across control intervals", () => {
+    const views = [0, 1, 2, 3].map((x, index): CameraView => ({
+      ...START,
+      id: `point-${index + 1}`,
+      position: [x, 1, 0],
+    }));
+
+    const samples = sampleCameraPath(views, 8);
+
+    expect(samples[2]?.position).toEqual(views[1]?.position);
+    expect(samples[5]?.position).toEqual(views[2]?.position);
+    expect(samples[7]?.position).toEqual(views[3]?.position);
   });
 });
 
@@ -284,6 +325,28 @@ describe("3D drawn camera paths", () => {
     expect(inserted?.segments[1]).toBe(parts[1]);
     expect(inserted?.segments[0]?.quaternions).toEqual([forward, null, left]);
     expect(parts[0]?.points).toHaveLength(2);
+  });
+
+  it("uses control-point timing when inserting on unequal path spans", () => {
+    const parts: TrajectorySegment[] = [
+      {
+        id: "one",
+        points: [
+          [0, 1, 0],
+          [1, 1, 0],
+          [101, 1, 0],
+        ],
+      },
+    ];
+
+    const inserted = insertTrajectoryPivot(parts, [0.8, 2, 0], 0.45);
+
+    expect(inserted).toMatchObject({
+      segmentId: "one",
+      pointIndex: 1,
+      pivotNumber: 2,
+    });
+    expect(inserted?.segments[0]?.points[1]).toEqual([0.8, 2, 0]);
   });
 
   it("does not add more than the manual pivot limit", () => {
@@ -632,6 +695,47 @@ describe("3D drawn camera paths", () => {
     expect(roundTrip[0]).toBeCloseTo(point[0]);
     expect(roundTrip[1]).toBeCloseTo(point[1]);
     expect(roundTrip[2]).toBeCloseTo(point[2]);
+  });
+
+  it("uses drawing zoom to make the same stroke travel less", () => {
+    const zoomedSpace = zoomTrajectorySpace(
+      SPACE,
+      2,
+      START.position,
+      FRONT_VIEW,
+    );
+    const normal = unprojectTrajectoryPoint(
+      [0.75, 0.5],
+      FRONT_VIEW,
+      SPACE,
+      START.position,
+    );
+    const zoomed = unprojectTrajectoryPoint(
+      [0.75, 0.5],
+      FRONT_VIEW,
+      zoomedSpace,
+      START.position,
+    );
+
+    expect(zoomed[0]).toBeCloseTo(normal[0] / 2);
+    const zoomedOutSpace = zoomTrajectorySpace(
+      SPACE,
+      0.5,
+      [20, 0, 0],
+      FRONT_VIEW,
+    );
+    expect(
+      projectTrajectoryPoint([20, 0, 0], FRONT_VIEW, zoomedOutSpace),
+    ).toEqual([1, 0.5]);
+    const recenteredSpace = zoomTrajectorySpace(
+      SPACE,
+      1,
+      [20, 0, 0],
+      FRONT_VIEW,
+    );
+    expect(
+      projectTrajectoryPoint([20, 0, 0], FRONT_VIEW, recenteredSpace),
+    ).toEqual([0.5, 0.5]);
   });
 
   it("preserves depth when a stroke continues from a rotated main view", () => {
