@@ -5,17 +5,21 @@ import {
   buildTargetCameras,
   cameraDrawingView,
   cameraPathTarget,
+  cameraQuaternionFromDrawingView,
   cameraViewLookingAt,
+  cameraViewsFromSegments,
   cameraViewsFromTrajectory,
   insertTrajectoryPivot,
   MAX_PIVOTS_PER_PART,
   moveTrajectoryPoint,
   projectTrajectoryPoint,
   sampleCameraPath,
+  setTrajectoryPointQuaternion,
   trajectoryFloorBoundary,
   trajectoryPathFromSegments,
   unprojectTrajectoryPoint,
   type CameraView,
+  type TrajectorySegment,
   type TrajectorySpace,
 } from "./camera-trajectory";
 
@@ -34,23 +38,28 @@ const END: CameraView = {
 };
 
 describe("sampleCameraPath", () => {
-  it("keeps endpoint positions and faces forward along a moving path", () => {
+  it("keeps endpoint positions and manual endpoint angles", () => {
     const samples = sampleCameraPath([START, END], 9);
-    const pathForward = new THREE.Vector3(...END.position)
-      .sub(new THREE.Vector3(...START.position))
-      .normalize();
 
     expect(samples).toHaveLength(9);
     expect(samples[0]?.position).toEqual(START.position);
     expect(samples[0]?.fovRadians).toBe(START.fovRadians);
     expect(samples.at(-1)?.position).toEqual(END.position);
     expect(samples.at(-1)?.fovRadians).toBe(END.fovRadians);
-    for (const sample of [samples[0]!, samples.at(-1)!]) {
-      const cameraForward = new THREE.Vector3(0, 0, -1).applyQuaternion(
-        new THREE.Quaternion(...sample.quaternion),
-      );
-      expect(cameraForward.dot(pathForward)).toBeCloseTo(1);
-    }
+    expect(
+      Math.abs(
+        new THREE.Quaternion(...samples[0]!.quaternion).dot(
+          new THREE.Quaternion(...START.quaternion),
+        ),
+      ),
+    ).toBeCloseTo(1);
+    expect(
+      Math.abs(
+        new THREE.Quaternion(...samples.at(-1)!.quaternion).dot(
+          new THREE.Quaternion(...END.quaternion),
+        ),
+      ),
+    ).toBeCloseTo(1);
   });
 
   it("returns no path until two views have been captured", () => {
@@ -73,7 +82,7 @@ describe("sampleCameraPath", () => {
     expect(samples[3]?.quaternion[1]).toBeCloseTo(Math.sin((3 * Math.PI) / 16));
   });
 
-  it("faces every sampled camera along a curved spline", () => {
+  it("does not let path curvature change a manual camera angle", () => {
     const views = cameraViewsFromTrajectory(
       [
         [0, 1, 0],
@@ -85,53 +94,37 @@ describe("sampleCameraPath", () => {
     );
     const samples = sampleCameraPath(views, 51);
 
-    for (let index = 0; index < samples.length; index += 1) {
-      const previous = new THREE.Vector3(
-        ...samples[Math.max(0, index - 1)]!.position,
-      );
-      const next = new THREE.Vector3(
-        ...samples[Math.min(samples.length - 1, index + 1)]!.position,
-      );
-      const pathForward = next.sub(previous).normalize();
-      const cameraForward = new THREE.Vector3(0, 0, -1).applyQuaternion(
-        new THREE.Quaternion(...samples[index]!.quaternion),
-      );
-      expect(cameraForward.dot(pathForward)).toBeGreaterThan(0.995);
-      if (index > 0) {
-        const previousQuaternion = new THREE.Quaternion(
-          ...samples[index - 1]!.quaternion,
-        );
-        expect(
-          previousQuaternion.dot(
-            new THREE.Quaternion(...samples[index]!.quaternion),
+    for (const sample of samples) {
+      expect(
+        Math.abs(
+          new THREE.Quaternion(...sample.quaternion).dot(
+            new THREE.Quaternion(...START.quaternion),
           ),
-        ).toBeGreaterThanOrEqual(0);
-      }
+        ),
+      ).toBeCloseTo(1);
     }
   });
 
-  it("keeps the camera upright while following a 3D curve", () => {
-    const views = cameraViewsFromTrajectory(
-      [
-        [-4, 2, 3],
-        [0, 4, -1],
-        [6, 3, -5],
+  it("does not spin between equivalent quaternion signs", () => {
+    const equivalentEnd = {
+      ...END,
+      quaternion: START.quaternion.map((value) => -value) as [
+        number,
+        number,
+        number,
+        number,
       ],
-      START,
-    );
-    const samples = sampleCameraPath(views, 51);
+    };
+    const samples = sampleCameraPath([START, equivalentEnd], 51);
 
     for (const sample of samples) {
-      const cameraForward = new THREE.Vector3(0, 0, -1).applyQuaternion(
-        new THREE.Quaternion(...sample.quaternion),
-      );
-      const expectedUp = new THREE.Vector3(0, 1, 0)
-        .addScaledVector(cameraForward, -cameraForward.y)
-        .normalize();
-      const cameraUp = new THREE.Vector3(0, 1, 0).applyQuaternion(
-        new THREE.Quaternion(...sample.quaternion),
-      );
-      expect(cameraUp.dot(expectedUp)).toBeGreaterThan(0.999);
+      expect(
+        Math.abs(
+          new THREE.Quaternion(...sample.quaternion).dot(
+            new THREE.Quaternion(...START.quaternion),
+          ),
+        ),
+      ).toBeCloseTo(1);
     }
   });
 });
@@ -145,18 +138,17 @@ describe("buildTargetCameras", () => {
     expect(cameras[1]?.extrinsics.position).toEqual(END.position);
   });
 
-  it("faces generated cameras forward along the path", () => {
+  it("uses the manually chosen angles in generated cameras", () => {
     const cameras = buildTargetCameras([START, END], 9, 1280, 720);
-    const expectedForward = new THREE.Vector3(...END.position)
-      .sub(new THREE.Vector3(...START.position))
-      .normalize();
 
-    for (const camera of cameras) {
-      const cameraForward = new THREE.Vector3(0, 0, -1).applyQuaternion(
-        new THREE.Quaternion(...camera.extrinsics.quaternion),
-      );
-      expect(cameraForward.dot(expectedForward)).toBeGreaterThan(0.999);
-    }
+    expect(cameras[0]?.extrinsics.quaternion).toEqual(START.quaternion);
+    expect(
+      Math.abs(
+        new THREE.Quaternion(...cameras.at(-1)!.extrinsics.quaternion).dot(
+          new THREE.Quaternion(...END.quaternion),
+        ),
+      ),
+    ).toBeCloseTo(1);
   });
 });
 
@@ -202,13 +194,21 @@ const TURNED_VIEW = cameraDrawingView(
 
 describe("3D drawn camera paths", () => {
   it("inserts a draggable pivot into the nearest path span", () => {
-    const parts = [
+    const forward: [number, number, number, number] = [0, 0, 0, 1];
+    const left: [number, number, number, number] = [
+      0,
+      Math.SQRT1_2,
+      0,
+      Math.SQRT1_2,
+    ];
+    const parts: TrajectorySegment[] = [
       {
         id: "one",
         points: [
           [0, 1, 0],
           [10, 1, 0],
         ],
+        quaternions: [forward, left],
       },
       {
         id: "two",
@@ -217,17 +217,22 @@ describe("3D drawn camera paths", () => {
           [20, 1, 0],
         ],
       },
-    ] satisfies { id: string; points: [number, number, number][] }[];
+    ];
 
     const inserted = insertTrajectoryPivot(parts, [7, 3, 1], 0.35);
 
-    expect(inserted).toMatchObject({ segmentId: "one", pointIndex: 1 });
+    expect(inserted).toMatchObject({
+      segmentId: "one",
+      pointIndex: 1,
+      pivotNumber: 2,
+    });
     expect(inserted?.segments[0]?.points).toEqual([
       [0, 1, 0],
       [7, 3, 1],
       [10, 1, 0],
     ]);
     expect(inserted?.segments[1]).toBe(parts[1]);
+    expect(inserted?.segments[0]?.quaternions).toEqual([forward, null, left]);
     expect(parts[0]?.points).toHaveLength(2);
   });
 
@@ -270,6 +275,144 @@ describe("3D drawn camera paths", () => {
       [2, 1, 0],
     ]);
     expect(parts[0]?.points.at(-1)).toEqual([1, 1, 0]);
+  });
+
+  it("sets the same manual angle on both copies of a shared pivot", () => {
+    const parts: TrajectorySegment[] = [
+      {
+        id: "one",
+        points: [
+          [0, 1, 0],
+          [1, 1, 0],
+        ],
+      },
+      {
+        id: "two",
+        points: [
+          [1, 1, 0],
+          [2, 1, 0],
+        ],
+      },
+    ];
+    const angle = new THREE.Quaternion()
+      .setFromEuler(new THREE.Euler(-0.2, 0.8, 0))
+      .toArray();
+
+    const updated = setTrajectoryPointQuaternion(parts, "one", 1, angle);
+
+    expect(
+      Math.abs(
+        new THREE.Quaternion(...updated[0]!.quaternions![1]!).dot(
+          new THREE.Quaternion(...angle),
+        ),
+      ),
+    ).toBeCloseTo(1);
+    expect(updated[1]?.quaternions?.[0]).toEqual(updated[0]?.quaternions?.[1]);
+    expect(updated[0]?.quaternions?.[0]).toBeNull();
+    expect(parts[0]?.quaternions).toBeUndefined();
+  });
+
+  it("interpolates only the manual angle keys across path pivots", () => {
+    const forward: [number, number, number, number] = [0, 0, 0, 1];
+    const left = new THREE.Quaternion()
+      .setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2)
+      .toArray();
+    const views = cameraViewsFromSegments(
+      [
+        {
+          id: "one",
+          points: [
+            [0, 1, 0],
+            [1, 1, 0],
+            [2, 1, 0],
+          ],
+          quaternions: [forward, null, left],
+        },
+      ],
+      START,
+    );
+
+    const samples = sampleCameraPath(views, 3);
+    const middle = new THREE.Quaternion(...samples[1]!.quaternion);
+    expect(middle.angleTo(new THREE.Quaternion(...forward))).toBeCloseTo(
+      Math.PI / 4,
+    );
+    expect(samples[0]?.quaternion).toEqual(forward);
+    expect(samples[2]?.quaternion).toEqual(left);
+  });
+
+  it("holds one manual angle across the full path", () => {
+    const angle = new THREE.Quaternion()
+      .setFromEuler(new THREE.Euler(-0.3, 1.1, 0))
+      .toArray();
+    const views = cameraViewsFromSegments(
+      [
+        {
+          id: "one",
+          points: [
+            [0, 1, 0],
+            [2, 4, -3],
+            [5, 2, 1],
+          ],
+          quaternions: [null, angle, null],
+        },
+      ],
+      START,
+    );
+
+    for (const view of sampleCameraPath(views, 17)) {
+      expect(
+        Math.abs(
+          new THREE.Quaternion(...view.quaternion).dot(
+            new THREE.Quaternion(...angle),
+          ),
+        ),
+      ).toBeCloseTo(1);
+    }
+  });
+
+  it("does not turn an unset pivot into an angle key", () => {
+    const forward: [number, number, number, number] = [0, 0, 0, 1];
+    const left = new THREE.Quaternion()
+      .setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2)
+      .toArray();
+    const direct = cameraViewsFromSegments(
+      [
+        {
+          id: "direct",
+          points: [
+            [0, 1, 0],
+            [10, 1, 0],
+          ],
+          quaternions: [forward, left],
+        },
+      ],
+      START,
+    );
+    const withUnsetPivot = cameraViewsFromSegments(
+      [
+        {
+          id: "with-pivot",
+          points: [
+            [0, 1, 0],
+            [0.1, 1, 0],
+            [10, 1, 0],
+          ],
+          quaternions: [forward, null, left],
+        },
+      ],
+      START,
+    );
+    const directSamples = sampleCameraPath(direct, 21);
+    const pivotSamples = sampleCameraPath(withUnsetPivot, 21);
+
+    directSamples.forEach((sample, index) => {
+      expect(
+        new THREE.Quaternion(...sample.quaternion).angleTo(
+          new THREE.Quaternion(...pivotSamples[index]!.quaternion),
+        ),
+      ).toBeCloseTo(0);
+    });
   });
 
   it("does not move an unrelated part across a deleted-path gap", () => {
@@ -470,7 +613,7 @@ describe("3D drawn camera paths", () => {
     expect(samples.every((sample) => sample.position[1] >= 0)).toBe(true);
   });
 
-  it("turns a multi-view trajectory into spline control cameras", () => {
+  it("keeps the reference angle until manual pivot angles are set", () => {
     const path: [number, number, number][] = [
       [-10, 2, -10],
       [0, 5, 0],
@@ -481,21 +624,26 @@ describe("3D drawn camera paths", () => {
     expect(views).toHaveLength(3);
     expect(views[0]?.position).toEqual([-10, 2, -10]);
     expect(views.at(-1)?.position).toEqual([10, 3, 10]);
-    const firstForward = new THREE.Vector3(0, 0, -1).applyQuaternion(
-      new THREE.Quaternion(...views[0]!.quaternion),
-    );
-    const routeForward = new THREE.Vector3(...path[1]!)
-      .sub(new THREE.Vector3(...path[0]!))
-      .normalize();
-    expect(firstForward.dot(routeForward)).toBeCloseTo(1);
+    for (const view of views) {
+      expect(view.quaternion).toEqual(START.quaternion);
+    }
   });
 
   it("derives the drawing plane from the main camera quaternion", () => {
-    expect(cameraDrawingView(START.quaternion)).toEqual({
+    const drawingView = cameraDrawingView(START.quaternion);
+
+    expect(drawingView).toEqual({
       right: [1, 0, 0],
       up: [0, 1, 0],
       forward: [0, 0, -1],
     });
+    expect(
+      Math.abs(
+        new THREE.Quaternion(
+          ...cameraQuaternionFromDrawingView(drawingView),
+        ).dot(new THREE.Quaternion(...START.quaternion)),
+      ),
+    ).toBeCloseTo(1);
   });
 
   it("ignores a trajectory with only one point", () => {
