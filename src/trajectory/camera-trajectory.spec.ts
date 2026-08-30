@@ -326,6 +326,28 @@ describe("3D drawn camera paths", () => {
     expect(finalPath.slice(0, firstPath.length)).toEqual(firstPath);
   });
 
+  it("reduces a dense drawn stroke to a few spline controls", () => {
+    const stroke = Array.from({ length: 101 }, (_, index) => {
+      const progress = index / 100;
+      return [progress, 0.5 - Math.sin(progress * Math.PI) * 0.2] as [
+        number,
+        number,
+      ];
+    });
+
+    const path = appendDrawnTrajectory(
+      [],
+      stroke,
+      FRONT_VIEW,
+      SPACE,
+      START.position,
+    );
+
+    expect(path).toHaveLength(5);
+    expect(path[0]).toEqual([-10, 0, 4]);
+    expect(path.at(-1)).toEqual([10, 0, 4]);
+  });
+
   it("clamps vertical drawing and spline output to the floor", () => {
     expect(
       unprojectTrajectoryPoint([0.5, 1], FRONT_VIEW, SPACE, START.position)[1],

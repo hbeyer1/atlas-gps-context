@@ -27,6 +27,8 @@ export type TrajectorySpace = {
 };
 
 export const TRAJECTORY_FLOOR_Y = 0;
+const MAX_POINTS_PER_DRAWN_PART = 5;
+const DRAW_POINT_SPACING = 0.18;
 
 export function trajectoryPathFromSegments(
   segments: readonly TrajectorySegment[],
@@ -205,7 +207,7 @@ export function appendDrawnTrajectory(
 ): TrajectoryPoint[] {
   if (stroke.length < 2) return [...existing];
   const anchor = existing.at(-1) ?? referencePosition;
-  const newPoints = stroke
+  const newPoints = resampleDrawStroke(stroke)
     .slice(existing.length > 0 ? 1 : 0)
     .map((point) => unprojectTrajectoryPoint(point, view, space, anchor));
   const path = [...existing];
@@ -216,6 +218,48 @@ export function appendDrawnTrajectory(
     }
   }
   return path;
+}
+
+function resampleDrawStroke(stroke: readonly DrawPoint[]): DrawPoint[] {
+  const distances = [0];
+  for (let index = 1; index < stroke.length; index++) {
+    const previous = stroke[index - 1]!;
+    const current = stroke[index]!;
+    distances.push(
+      distances[index - 1]! +
+        Math.hypot(current[0] - previous[0], current[1] - previous[1]),
+    );
+  }
+
+  const totalDistance = distances.at(-1)!;
+  const pointCount = Math.min(
+    MAX_POINTS_PER_DRAWN_PART,
+    Math.max(2, Math.ceil(totalDistance / DRAW_POINT_SPACING) + 1),
+  );
+  if (stroke.length <= pointCount || totalDistance < 1e-6) return [...stroke];
+
+  let segmentIndex = 1;
+  return Array.from({ length: pointCount }, (_, index) => {
+    const targetDistance = (totalDistance * index) / (pointCount - 1);
+    while (
+      segmentIndex < distances.length - 1 &&
+      distances[segmentIndex]! < targetDistance
+    ) {
+      segmentIndex += 1;
+    }
+    const startDistance = distances[segmentIndex - 1]!;
+    const endDistance = distances[segmentIndex]!;
+    const amount =
+      endDistance === startDistance
+        ? 0
+        : (targetDistance - startDistance) / (endDistance - startDistance);
+    const start = stroke[segmentIndex - 1]!;
+    const end = stroke[segmentIndex]!;
+    return [
+      THREE.MathUtils.lerp(start[0], end[0], amount),
+      THREE.MathUtils.lerp(start[1], end[1], amount),
+    ];
+  });
 }
 
 export function cameraViewsFromTrajectory(
