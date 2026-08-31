@@ -210,6 +210,14 @@ describe("buildTargetCameras", () => {
 
     expect(new Set(cameras.map((camera) => camera.intrinsics.fy)).size).toBe(1);
   });
+
+  it("uses the model portrait raster without changing vertical field of view", () => {
+    const landscape = buildTargetCameras([START, END], 2, 1280, 720);
+    const portrait = buildTargetCameras([START, END], 2, 400, 720);
+
+    expect(portrait[0]?.intrinsics).toMatchObject({ width: 400, height: 720 });
+    expect(portrait[0]?.intrinsics.fy).toBeCloseTo(landscape[0]!.intrinsics.fy);
+  });
 });
 
 describe("click-to-place camera points", () => {
@@ -267,6 +275,17 @@ describe("camera direction preview", () => {
 
     expect(projected[0]?.x).toBeCloseTo(0.5);
     expect(projected[0]?.y).toBeCloseTo(0.5);
+  });
+
+  it("uses the selected aspect when clipping the approximate view", () => {
+    const view = { ...START, position: [0, 0, 0] as [number, number, number] };
+
+    expect(projectCameraPreviewPoints([[1, 0, -2]], view, 16 / 9)).toHaveLength(
+      1,
+    );
+    expect(projectCameraPreviewPoints([[1, 0, -2]], view, 400 / 720)).toEqual(
+      [],
+    );
   });
 });
 
