@@ -124,6 +124,65 @@ export function moveTrajectoryPoint(
   });
 }
 
+export function deleteTrajectoryPivot(
+  segments: readonly TrajectorySegment[],
+  segmentId: string,
+  pointIndex: number,
+): TrajectorySegment[] | null {
+  if (trajectoryPathEntries(segments).length <= 2) return null;
+
+  const segmentIndex = segments.findIndex(
+    (segment) => segment.id === segmentId,
+  );
+  const segment = segments[segmentIndex];
+  const position = segment?.points[pointIndex];
+  if (!segment || !position) return null;
+
+  const storedPoints = segments.flatMap((current, currentIndex) =>
+    current.points.map((point, currentPointIndex) => ({
+      point,
+      segmentIndex: currentIndex,
+      pointIndex: currentPointIndex,
+    })),
+  );
+  const selectedIndex = storedPoints.findIndex(
+    (entry) =>
+      entry.segmentIndex === segmentIndex && entry.pointIndex === pointIndex,
+  );
+  let firstDuplicate = selectedIndex;
+  let lastDuplicate = selectedIndex;
+  while (
+    firstDuplicate > 0 &&
+    sameTrajectoryPoint(storedPoints[firstDuplicate - 1]!.point, position)
+  ) {
+    firstDuplicate -= 1;
+  }
+  while (
+    lastDuplicate < storedPoints.length - 1 &&
+    sameTrajectoryPoint(storedPoints[lastDuplicate + 1]!.point, position)
+  ) {
+    lastDuplicate += 1;
+  }
+
+  const removedIndexes = new Map<number, Set<number>>();
+  storedPoints.slice(firstDuplicate, lastDuplicate + 1).forEach((entry) => {
+    const indexes = removedIndexes.get(entry.segmentIndex) ?? new Set();
+    indexes.add(entry.pointIndex);
+    removedIndexes.set(entry.segmentIndex, indexes);
+  });
+
+  return segments.flatMap((current, currentIndex) => {
+    const indexes = removedIndexes.get(currentIndex);
+    if (!indexes) return [current];
+    const points = current.points.filter((_, index) => !indexes.has(index));
+    if (points.length === 0) return [];
+    const quaternions = current.quaternions
+      ? current.quaternions.filter((_, index) => !indexes.has(index))
+      : current.quaternions;
+    return [{ ...current, points, quaternions }];
+  });
+}
+
 export function setTrajectoryPointQuaternion(
   segments: readonly TrajectorySegment[],
   segmentId: string,
@@ -530,16 +589,21 @@ export function projectCameraPreviewPoints(
   points: readonly TrajectoryPoint[],
   view: CameraView,
   aspectRatio = 16 / 9,
-): { x: number; y: number; depth: number }[] {
+): { x: number; y: number; depth: number; pointIndex: number }[] {
   const cameraPosition = new THREE.Vector3(...view.position);
   const worldToCamera = new THREE.Quaternion(...view.quaternion)
     .normalize()
     .invert();
   const halfHeightAtUnitDepth = Math.tan(view.fovRadians / 2);
   const local = new THREE.Vector3();
-  const projected: { x: number; y: number; depth: number }[] = [];
+  const projected: {
+    x: number;
+    y: number;
+    depth: number;
+    pointIndex: number;
+  }[] = [];
 
-  for (const point of points) {
+  for (const [pointIndex, point] of points.entries()) {
     local
       .set(...point)
       .sub(cameraPosition)
@@ -549,7 +613,7 @@ export function projectCameraPreviewPoints(
     const x = 0.5 + local.x / (2 * depth * halfHeightAtUnitDepth * aspectRatio);
     const y = 0.5 - local.y / (2 * depth * halfHeightAtUnitDepth);
     if (x < 0 || x > 1 || y < 0 || y > 1) continue;
-    projected.push({ x, y, depth });
+    projected.push({ x, y, depth, pointIndex });
   }
   return projected;
 }

@@ -11,6 +11,7 @@ import {
   cameraViewLookingAt,
   cameraViewsFromSegments,
   cameraViewsFromTrajectory,
+  deleteTrajectoryPivot,
   frameTrajectorySpaceAboveFloor,
   insertTrajectoryPivot,
   MAX_PIVOTS_PER_PART,
@@ -254,14 +255,20 @@ describe("camera direction preview", () => {
     const projected = projectCameraPreviewPoints(
       [
         [0, 0, -2],
-        [1, 1, -2],
         [0, 0, 2],
+        [1, 1, -2],
       ],
       { ...START, position: [0, 0, 0] },
     );
 
     expect(projected).toHaveLength(2);
-    expect(projected[0]).toEqual({ x: 0.5, y: 0.5, depth: 2 });
+    expect(projected[0]).toEqual({
+      x: 0.5,
+      y: 0.5,
+      depth: 2,
+      pointIndex: 0,
+    });
+    expect(projected[1]?.pointIndex).toBe(2);
     expect(projected[1]!.x).toBeGreaterThan(0.5);
     expect(projected[1]!.y).toBeLessThan(0.5);
   });
@@ -301,6 +308,89 @@ const TURNED_VIEW = cameraDrawingView(
 );
 
 describe("3D drawn camera paths", () => {
+  it("deletes an interior camera position and its facing key", () => {
+    const forward: [number, number, number, number] = [0, 0, 0, 1];
+    const left: [number, number, number, number] = [
+      0,
+      Math.SQRT1_2,
+      0,
+      Math.SQRT1_2,
+    ];
+    const parts: TrajectorySegment[] = [
+      {
+        id: "one",
+        points: [
+          [0, 1, 0],
+          [1, 1, 0],
+          [2, 1, 0],
+        ],
+        quaternions: [forward, left, forward],
+      },
+    ];
+
+    const deleted = deleteTrajectoryPivot(parts, "one", 1);
+
+    expect(deleted).toEqual([
+      {
+        id: "one",
+        points: [
+          [0, 1, 0],
+          [2, 1, 0],
+        ],
+        quaternions: [forward, forward],
+      },
+    ]);
+    expect(parts[0]?.points).toHaveLength(3);
+  });
+
+  it("deletes every consecutive stored copy of one camera point", () => {
+    const parts: TrajectorySegment[] = [
+      {
+        id: "one",
+        points: [
+          [0, 1, 0],
+          [1, 1, 0],
+          [1, 1, 0],
+        ],
+      },
+      {
+        id: "two",
+        points: [
+          [1, 1, 0],
+          [2, 1, 0],
+          [3, 1, 0],
+        ],
+      },
+    ];
+
+    const deleted = deleteTrajectoryPivot(parts, "one", 1)!;
+
+    expect(deleted[0]?.points).toEqual([[0, 1, 0]]);
+    expect(deleted[1]?.points).toEqual([
+      [2, 1, 0],
+      [3, 1, 0],
+    ]);
+    expect(trajectoryPathFromSegments(deleted)).toEqual([
+      [0, 1, 0],
+      [2, 1, 0],
+      [3, 1, 0],
+    ]);
+  });
+
+  it("keeps the minimum two camera points", () => {
+    const parts: TrajectorySegment[] = [
+      {
+        id: "one",
+        points: [
+          [0, 1, 0],
+          [1, 1, 0],
+        ],
+      },
+    ];
+
+    expect(deleteTrajectoryPivot(parts, "one", 0)).toBeNull();
+  });
+
   it("inserts a draggable pivot into the nearest path span", () => {
     const forward: [number, number, number, number] = [0, 0, 0, 1];
     const left: [number, number, number, number] = [
