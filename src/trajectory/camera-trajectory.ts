@@ -282,20 +282,40 @@ export function cameraDrawingView(
   };
 }
 
-export function zoomTrajectorySpace(
+export function frameTrajectorySpaceAboveFloor(
   space: TrajectorySpace,
-  zoom: number,
-  anchor: TrajectoryPoint,
   view: TrajectoryDrawingView,
+  anchor: TrajectoryPoint,
 ): TrajectorySpace {
-  const zoomedSpace: TrajectorySpace = {
-    center: [...space.center],
-    radius: space.radius / zoom,
-  };
-  const [x, y] = projectTrajectoryPoint(anchor, view, zoomedSpace);
-  return x >= 0 && x <= 1 && y >= 0 && y <= 1
-    ? zoomedSpace
-    : { ...zoomedSpace, center: [...anchor] };
+  const [anchorX, anchorY] = projectTrajectoryPoint(anchor, view, space);
+  const anchoredSpace =
+    anchorX >= 0 && anchorX <= 1 && anchorY >= 0 && anchorY <= 1
+      ? space
+      : { ...space, center: [...anchor] as TrajectoryPoint };
+  const boundary = trajectoryFloorBoundary(view, anchoredSpace, anchor);
+  if (!boundary) return anchoredSpace;
+
+  const floorFacesDown = view.up[1] >= 0;
+  const currentEdge = floorFacesDown
+    ? Math.max(boundary[0][1], boundary[1][1])
+    : Math.min(boundary[0][1], boundary[1][1]);
+  const targetEdge = floorFacesDown ? 0.94 : 0.06;
+  const [, anchoredAnchorY] = projectTrajectoryPoint(
+    anchor,
+    view,
+    anchoredSpace,
+  );
+  const screenShift = THREE.MathUtils.clamp(
+    targetEdge - currentEdge,
+    0.06 - anchoredAnchorY,
+    0.94 - anchoredAnchorY,
+  );
+  const shift = screenShift * anchoredSpace.radius * 2;
+  const center = new THREE.Vector3(...anchoredSpace.center).addScaledVector(
+    new THREE.Vector3(...view.up),
+    shift,
+  );
+  return { center: center.toArray(), radius: anchoredSpace.radius };
 }
 
 export function projectTrajectoryPoint(
@@ -337,7 +357,7 @@ export function trajectoryFloorBoundary(
   space: TrajectorySpace,
   anchor: TrajectoryPoint,
 ): [DrawPoint, DrawPoint] | null {
-  if (Math.abs(view.up[1]) < 1e-4) return null;
+  if (Math.abs(view.up[1]) < 0.1) return null;
 
   const center = new THREE.Vector3(...space.center);
   const forward = new THREE.Vector3(...view.forward);
@@ -480,10 +500,11 @@ export function cameraAimDegrees(quaternion: TrajectoryQuaternion): {
     "YXZ",
   );
   return {
-    yaw: THREE.MathUtils.euclideanModulo(
-      -THREE.MathUtils.radToDeg(euler.y) + 180,
-      360,
-    ) - 180,
+    yaw:
+      THREE.MathUtils.euclideanModulo(
+        -THREE.MathUtils.radToDeg(euler.y) + 180,
+        360,
+      ) - 180,
     pitch: THREE.MathUtils.radToDeg(euler.x),
   };
 }
@@ -519,11 +540,13 @@ export function projectCameraPreviewPoints(
   const projected: { x: number; y: number; depth: number }[] = [];
 
   for (const point of points) {
-    local.set(...point).sub(cameraPosition).applyQuaternion(worldToCamera);
+    local
+      .set(...point)
+      .sub(cameraPosition)
+      .applyQuaternion(worldToCamera);
     const depth = -local.z;
     if (depth <= 0.01) continue;
-    const x =
-      0.5 + local.x / (2 * depth * halfHeightAtUnitDepth * aspectRatio);
+    const x = 0.5 + local.x / (2 * depth * halfHeightAtUnitDepth * aspectRatio);
     const y = 0.5 - local.y / (2 * depth * halfHeightAtUnitDepth);
     if (x < 0 || x > 1 || y < 0 || y > 1) continue;
     projected.push({ x, y, depth });

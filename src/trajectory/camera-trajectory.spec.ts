@@ -11,6 +11,7 @@ import {
   cameraViewLookingAt,
   cameraViewsFromSegments,
   cameraViewsFromTrajectory,
+  frameTrajectorySpaceAboveFloor,
   insertTrajectoryPivot,
   MAX_PIVOTS_PER_PART,
   moveTrajectoryPoint,
@@ -22,8 +23,8 @@ import {
   trajectoryPathFromSegments,
   trajectoryPivotsFromSegments,
   unprojectTrajectoryPoint,
-  zoomTrajectorySpace,
   type CameraView,
+  type TrajectoryDrawingView,
   type TrajectorySegment,
   type TrajectorySpace,
 } from "./camera-trajectory";
@@ -258,14 +259,11 @@ describe("camera direction preview", () => {
   });
 
   it("shows the world direction chosen by yaw", () => {
-    const projected = projectCameraPreviewPoints(
-      [[2, 0, 0]],
-      {
-        ...START,
-        position: [0, 0, 0],
-        quaternion: cameraQuaternionFromAim(90, 0),
-      },
-    );
+    const projected = projectCameraPreviewPoints([[2, 0, 0]], {
+      ...START,
+      position: [0, 0, 0],
+      quaternion: cameraQuaternionFromAim(90, 0),
+    });
 
     expect(projected[0]?.x).toBeCloseTo(0.5);
     expect(projected[0]?.y).toBeCloseTo(0.5);
@@ -697,45 +695,92 @@ describe("3D drawn camera paths", () => {
     expect(roundTrip[2]).toBeCloseTo(point[2]);
   });
 
-  it("uses drawing zoom to make the same stroke travel less", () => {
-    const zoomedSpace = zoomTrajectorySpace(
+  it("frames the floor near the bottom without changing world scale", () => {
+    const frontSpace = frameTrajectorySpaceAboveFloor(
       SPACE,
-      2,
-      START.position,
       FRONT_VIEW,
-    );
-    const normal = unprojectTrajectoryPoint(
-      [0.75, 0.5],
-      FRONT_VIEW,
-      SPACE,
       START.position,
     );
-    const zoomed = unprojectTrajectoryPoint(
-      [0.75, 0.5],
+    const frontBoundary = trajectoryFloorBoundary(
       FRONT_VIEW,
-      zoomedSpace,
+      frontSpace,
       START.position,
+    )!;
+    const turnedSpace = frameTrajectorySpaceAboveFloor(
+      SPACE,
+      TURNED_VIEW,
+      START.position,
+    );
+    const turnedBoundary = trajectoryFloorBoundary(
+      TURNED_VIEW,
+      turnedSpace,
+      START.position,
+    )!;
+
+    expect(frontSpace.radius).toBe(SPACE.radius);
+    expect(Math.max(frontBoundary[0][1], frontBoundary[1][1])).toBeCloseTo(
+      0.94,
+    );
+    expect(Math.max(turnedBoundary[0][1], turnedBoundary[1][1])).toBeCloseTo(
+      0.94,
+    );
+  });
+
+  it("recenters a far path endpoint before framing the floor", () => {
+    const anchor: [number, number, number] = [20, 0, 0];
+    const framedSpace = frameTrajectorySpaceAboveFloor(
+      SPACE,
+      FRONT_VIEW,
+      anchor,
+    );
+    const projectedAnchor = projectTrajectoryPoint(
+      anchor,
+      FRONT_VIEW,
+      framedSpace,
     );
 
-    expect(zoomed[0]).toBeCloseTo(normal[0] / 2);
-    const zoomedOutSpace = zoomTrajectorySpace(
+    expect(projectedAnchor[0]).toBeCloseTo(0.5);
+    expect(projectedAnchor[1]).toBeCloseTo(0.94);
+  });
+
+  it("keeps a high path endpoint visible when the floor cannot fit", () => {
+    const anchor: [number, number, number] = [0, 19, 0];
+    const framedSpace = frameTrajectorySpaceAboveFloor(
       SPACE,
-      0.5,
-      [20, 0, 0],
       FRONT_VIEW,
+      anchor,
     );
-    expect(
-      projectTrajectoryPoint([20, 0, 0], FRONT_VIEW, zoomedOutSpace),
-    ).toEqual([1, 0.5]);
-    const recenteredSpace = zoomTrajectorySpace(
-      SPACE,
-      1,
-      [20, 0, 0],
+    const projectedAnchor = projectTrajectoryPoint(
+      anchor,
       FRONT_VIEW,
+      framedSpace,
     );
+    const floorBoundary = trajectoryFloorBoundary(
+      FRONT_VIEW,
+      framedSpace,
+      anchor,
+    )!;
+
+    expect(framedSpace.radius).toBe(SPACE.radius);
+    expect(projectedAnchor[1]).toBeCloseTo(0.06);
+    expect(Math.max(floorBoundary[0][1], floorBoundary[1][1])).toBeGreaterThan(
+      0.94,
+    );
+  });
+
+  it("leaves the drawing space unchanged when the floor is nearly edge-on", () => {
+    const nearOverheadView: TrajectoryDrawingView = {
+      right: [1, 0, 0],
+      up: [0, 0.05, -Math.sqrt(1 - 0.05 ** 2)],
+      forward: [0, Math.sqrt(1 - 0.05 ** 2), 0.05],
+    };
+
     expect(
-      projectTrajectoryPoint([20, 0, 0], FRONT_VIEW, recenteredSpace),
-    ).toEqual([0.5, 0.5]);
+      frameTrajectorySpaceAboveFloor(SPACE, nearOverheadView, START.position),
+    ).toBe(SPACE);
+    expect(
+      trajectoryFloorBoundary(nearOverheadView, SPACE, START.position),
+    ).toBeNull();
   });
 
   it("preserves depth when a stroke continues from a rotated main view", () => {
