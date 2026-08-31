@@ -40,6 +40,10 @@ export const TRAJECTORY_FLOOR_Y = 0;
 export const MAX_PIVOTS_PER_PART = 12;
 const MAX_POINTS_PER_DRAWN_PART = 5;
 const DRAW_POINT_SPACING = 0.18;
+const POSITION_SMOOTHING_WEIGHTS = [1, 6, 15, 20, 15, 6, 1] as const;
+const POSITION_SMOOTHING_WEIGHT_TOTAL = 64;
+const POSITION_SMOOTHING_REFERENCE_FRAMES = 96;
+const POSITION_SMOOTHING_STEP = 1 / POSITION_SMOOTHING_REFERENCE_FRAMES;
 
 export function trajectoryPathFromSegments(
   segments: readonly TrajectorySegment[],
@@ -541,11 +545,10 @@ export function cameraQuaternionAtView(
   if (views.length === 0) return [0, 0, 0, 1];
   if (views.length === 1) return views[0]!.quaternion;
 
-  const { quaternions, progresses } = cameraOrientationKeys(views);
+  const orientationKeys = cameraOrientationKeys(views);
   const index = THREE.MathUtils.clamp(viewIndex, 0, views.length - 1);
   return quaternionAtProgress(
-    quaternions,
-    progresses,
+    orientationKeys,
     index / (views.length - 1),
   ).toArray();
 }
@@ -630,16 +633,16 @@ export function sampleCameraPath(
     false,
     "centripetal",
   );
-  const { quaternions, progresses } = cameraOrientationKeys(views);
+  const orientationKeys = cameraOrientationKeys(views);
   const segmentCount = views.length - 1;
   const constantFovRadians = views.every(
     (view) => view.fovRadians === views[0]!.fovRadians,
   )
     ? views[0]!.fovRadians
     : null;
-  let previousQuaternion = quaternions[0]!.clone();
+  let previousQuaternion = orientationKeys.quaternions[0]!.clone();
 
-  return Array.from({ length: frameCount }, (_, index) => {
+  const samples = Array.from({ length: frameCount }, (_, index) => {
     const curveProgress = cameraPathProgressAtFrame(
       index,
       frameCount,
@@ -650,15 +653,11 @@ export function sampleCameraPath(
         ? new THREE.Vector3(...floorSafePosition(views[0]!.position))
         : index === frameCount - 1
           ? new THREE.Vector3(...floorSafePosition(views.at(-1)!.position))
-          : floorSafeCurvePoint(curve, curveProgress);
+          : smoothCurvePoint(curve, curveProgress);
     const viewProgress = curveProgress * segmentCount;
     const segment = Math.min(Math.floor(viewProgress), segmentCount - 1);
     const amount = THREE.MathUtils.clamp(viewProgress - segment, 0, 1);
-    const quaternion = quaternionAtProgress(
-      quaternions,
-      progresses,
-      curveProgress,
-    );
+    const quaternion = quaternionAtProgress(orientationKeys, curveProgress);
     if (previousQuaternion.dot(quaternion) < 0) {
       quaternion.set(
         -quaternion.x,
@@ -682,6 +681,7 @@ export function sampleCameraPath(
       fovRadians,
     };
   });
+  return samples;
 }
 
 export function cameraPathProgressAtFrame(
@@ -707,10 +707,20 @@ export function cameraPathProgressAtFrame(
   return (segment + amount) / segmentCount;
 }
 
-function cameraOrientationKeys(views: readonly CameraView[]): {
+type ScalarSpline = {
+  values: number[];
+  slopes: number[];
+};
+
+type CameraOrientationKeys = {
   quaternions: THREE.Quaternion[];
   progresses: number[];
-} {
+  aimSpline: { yaw: ScalarSpline; pitch: ScalarSpline } | null;
+};
+
+function cameraOrientationKeys(
+  views: readonly CameraView[],
+): CameraOrientationKeys {
   const explicitKeyIndices = views.flatMap((view, index) =>
     view.angleKey ? [index] : [],
   );
@@ -728,17 +738,19 @@ function cameraOrientationKeys(views: readonly CameraView[]): {
       current.set(-current.x, -current.y, -current.z, -current.w);
     }
   }
+  const progresses = keyIndices.map((index) => index / (views.length - 1));
   return {
     quaternions,
-    progresses: keyIndices.map((index) => index / (views.length - 1)),
+    progresses,
+    aimSpline: cameraAimSpline(quaternions, progresses),
   };
 }
 
 function quaternionAtProgress(
-  quaternions: readonly THREE.Quaternion[],
-  progresses: readonly number[],
+  keys: CameraOrientationKeys,
   progress: number,
 ): THREE.Quaternion {
+  const { aimSpline, progresses, quaternions } = keys;
   if (quaternions.length === 1 || progress <= progresses[0]!) {
     return quaternions[0]!.clone();
   }
@@ -750,6 +762,27 @@ function quaternionAtProgress(
   const endIndex = progresses.findIndex((value) => value >= progress);
   const startProgress = progresses[endIndex - 1]!;
   const endProgress = progresses[endIndex]!;
+  if (Math.abs(progress - endProgress) < 1e-8) {
+    return quaternions[endIndex]!.clone();
+  }
+  if (aimSpline) {
+    return new THREE.Quaternion(
+      ...cameraQuaternionFromAim(
+        cubicHermiteAtProgress(
+          aimSpline.yaw,
+          progresses,
+          endIndex,
+          progress,
+        ),
+        cubicHermiteAtProgress(
+          aimSpline.pitch,
+          progresses,
+          endIndex,
+          progress,
+        ),
+      ),
+    );
+  }
   const amount =
     endProgress - startProgress > 1e-8
       ? (progress - startProgress) / (endProgress - startProgress)
@@ -759,6 +792,147 @@ function quaternionAtProgress(
     quaternions[endIndex]!,
     amount,
   );
+}
+
+function cameraAimSpline(
+  quaternions: readonly THREE.Quaternion[],
+  progresses: readonly number[],
+): CameraOrientationKeys["aimSpline"] {
+  if (quaternions.length < 2) return null;
+
+  const aims = quaternions.map((quaternion) =>
+    cameraAimDegrees(quaternion.toArray()),
+  );
+  const hasRoll = quaternions.some((quaternion, index) =>
+    quaternion.angleTo(
+      new THREE.Quaternion(
+        ...cameraQuaternionFromAim(aims[index]!.yaw, aims[index]!.pitch),
+      ),
+    ) > 1e-5,
+  );
+  if (hasRoll) return null;
+
+  const yawValues = [aims[0]!.yaw];
+  for (const aim of aims.slice(1)) {
+    const previous = yawValues.at(-1)!;
+    const shortestTurn =
+      THREE.MathUtils.euclideanModulo(aim.yaw - previous + 180, 360) - 180;
+    yawValues.push(previous + shortestTurn);
+  }
+  const pitchValues = aims.map((aim) => aim.pitch);
+  const spline = {
+    yaw: scalarSpline(progresses, yawValues),
+    pitch: scalarSpline(progresses, pitchValues),
+  };
+  if (progresses[0]! > 0) {
+    spline.yaw.slopes[0] = 0;
+    spline.pitch.slopes[0] = 0;
+  }
+  if (progresses.at(-1)! < 1) {
+    spline.yaw.slopes[spline.yaw.slopes.length - 1] = 0;
+    spline.pitch.slopes[spline.pitch.slopes.length - 1] = 0;
+  }
+  return spline;
+}
+
+function scalarSpline(
+  progresses: readonly number[],
+  values: readonly number[],
+): ScalarSpline {
+  return {
+    values: [...values],
+    slopes: monotoneCubicSlopes(progresses, values),
+  };
+}
+
+function monotoneCubicSlopes(
+  progresses: readonly number[],
+  values: readonly number[],
+): number[] {
+  const intervalWidths = values.slice(1).map(
+    (_, index) => progresses[index + 1]! - progresses[index]!,
+  );
+  const intervalSlopes = intervalWidths.map(
+    (width, index) => (values[index + 1]! - values[index]!) / width,
+  );
+  const slopes = Array.from({ length: values.length }, () => 0);
+  slopes[0] = intervalSlopes[0]!;
+  for (let index = 1; index < values.length - 1; index += 1) {
+    const previousSlope = intervalSlopes[index - 1]!;
+    const nextSlope = intervalSlopes[index]!;
+    if (previousSlope === 0 || nextSlope === 0 || previousSlope * nextSlope < 0)
+      continue;
+
+    const previousWidth = intervalWidths[index - 1]!;
+    const nextWidth = intervalWidths[index]!;
+    const previousWeight = 2 * nextWidth + previousWidth;
+    const nextWeight = nextWidth + 2 * previousWidth;
+    slopes[index] =
+      (previousWeight + nextWeight) /
+      (previousWeight / previousSlope + nextWeight / nextSlope);
+  }
+  slopes[values.length - 1] = intervalSlopes.at(-1)!;
+  return slopes;
+}
+
+function cubicHermiteAtProgress(
+  spline: ScalarSpline,
+  progresses: readonly number[],
+  endIndex: number,
+  progress: number,
+): number {
+  const startIndex = endIndex - 1;
+  const startProgress = progresses[startIndex]!;
+  const width = progresses[endIndex]! - startProgress;
+  const amount = (progress - startProgress) / width;
+  const amountSquared = amount * amount;
+  const amountCubed = amountSquared * amount;
+  return (
+    (2 * amountCubed - 3 * amountSquared + 1) *
+      spline.values[startIndex]! +
+    (amountCubed - 2 * amountSquared + amount) *
+      width *
+      spline.slopes[startIndex]! +
+    (-2 * amountCubed + 3 * amountSquared) * spline.values[endIndex]! +
+    (amountCubed - amountSquared) * width * spline.slopes[endIndex]!
+  );
+}
+
+function smoothCurvePoint(
+  curve: THREE.CatmullRomCurve3,
+  progress: number,
+): THREE.Vector3 {
+  if (progress <= 0 || progress >= 1) {
+    return floorSafeCurvePoint(curve, THREE.MathUtils.clamp(progress, 0, 1));
+  }
+
+  const point = new THREE.Vector3();
+  POSITION_SMOOTHING_WEIGHTS.forEach((weight, index) => {
+    const offset = index - Math.floor(POSITION_SMOOTHING_WEIGHTS.length / 2);
+    point.addScaledVector(
+      extendedCurvePoint(curve, progress + offset * POSITION_SMOOTHING_STEP),
+      weight / POSITION_SMOOTHING_WEIGHT_TOTAL,
+    );
+  });
+  point.y = Math.max(TRAJECTORY_FLOOR_Y, point.y);
+  return point;
+}
+
+function extendedCurvePoint(
+  curve: THREE.CatmullRomCurve3,
+  progress: number,
+): THREE.Vector3 {
+  if (progress < 0) {
+    return floorSafeCurvePoint(curve, 0)
+      .multiplyScalar(2)
+      .sub(floorSafeCurvePoint(curve, -progress));
+  }
+  if (progress > 1) {
+    return floorSafeCurvePoint(curve, 1)
+      .multiplyScalar(2)
+      .sub(floorSafeCurvePoint(curve, 2 - progress));
+  }
+  return floorSafeCurvePoint(curve, progress);
 }
 
 function floorSafeCurvePoint(

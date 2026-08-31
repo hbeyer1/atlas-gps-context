@@ -89,6 +89,72 @@ describe("sampleCameraPath", () => {
     expect(samples[3]?.quaternion[1]).toBeCloseTo(Math.sin((3 * Math.PI) / 16));
   });
 
+  it("smoothly reverses pitch at a manual angle without overshooting", () => {
+    const views = [0, 30, 0].map((pitch, index): CameraView => ({
+      ...START,
+      id: `pitch-${index + 1}`,
+      position: [index, 1, 0],
+      quaternion: cameraQuaternionFromAim(0, pitch),
+      angleKey: true,
+    }));
+
+    const pitches = sampleCameraPath(views, 49).map(
+      (sample) => cameraAimDegrees(sample.quaternion).pitch,
+    );
+    const incomingStep = pitches[24]! - pitches[23]!;
+    const outgoingStep = pitches[25]! - pitches[24]!;
+
+    expect(pitches[24]).toBeCloseTo(30);
+    expect(Math.max(...pitches)).toBeLessThanOrEqual(30 + 1e-8);
+    expect(Math.abs(outgoingStep - incomingStep)).toBeLessThan(0.3);
+  });
+
+  it("takes the short yaw path through the wraparound boundary", () => {
+    const views = [170, -170, 170].map((yaw, index): CameraView => ({
+      ...START,
+      id: `yaw-${index + 1}`,
+      position: [index, 1, 0],
+      quaternion: cameraQuaternionFromAim(yaw, 0),
+      angleKey: true,
+    }));
+
+    const samples = sampleCameraPath(views, 49);
+    const largestStep = Math.max(
+      ...samples.slice(1).map((sample, index) =>
+        THREE.MathUtils.radToDeg(
+          new THREE.Quaternion(...samples[index]!.quaternion).angleTo(
+            new THREE.Quaternion(...sample.quaternion),
+          ),
+        ),
+      ),
+    );
+
+    expect(largestStep).toBeLessThan(2);
+    expect(cameraAimDegrees(samples[24]!.quaternion).yaw).toBeCloseTo(-170);
+  });
+
+  it("eases into and out of interior manual angle keys", () => {
+    const views = [0, 1, 2, 3, 4].map((x, index): CameraView => ({
+      ...START,
+      id: `interior-angle-${index + 1}`,
+      position: [x, 1, 0],
+      quaternion:
+        index === 3 ? cameraQuaternionFromAim(0, 30) : START.quaternion,
+      angleKey: index === 1 || index === 3,
+    }));
+
+    const pitches = sampleCameraPath(views, 49).map(
+      (sample) => cameraAimDegrees(sample.quaternion).pitch,
+    );
+
+    expect(pitches[11]).toBeCloseTo(0);
+    expect(pitches[12]).toBeCloseTo(0);
+    expect(pitches[13]! - pitches[12]!).toBeLessThan(0.2);
+    expect(pitches[36]).toBeCloseTo(30);
+    expect(pitches[36]! - pitches[35]!).toBeLessThan(0.2);
+    expect(pitches[37]).toBeCloseTo(30);
+  });
+
   it("does not let path curvature change a manual camera angle", () => {
     const views = cameraViewsFromTrajectory(
       [
@@ -153,12 +219,34 @@ describe("sampleCameraPath", () => {
 
     const samples = sampleCameraPath(views, 5);
 
-    expect(samples[2]?.position).toEqual(views[1]?.position);
     expect(
       new THREE.Quaternion(...samples[2]!.quaternion).angleTo(
         new THREE.Quaternion(...middleQuaternion),
       ),
     ).toBeCloseTo(0);
+  });
+
+  it("moves smoothly through uneven approximate camera positions", () => {
+    const views: CameraView[] = [0, 1, 11].map((x, index) => ({
+      ...START,
+      id: `position-${index + 1}`,
+      position: [x, 1, 0],
+    }));
+
+    const samples = sampleCameraPath(views, 49);
+    const incomingVelocity = new THREE.Vector3(...samples[24]!.position).sub(
+      new THREE.Vector3(...samples[23]!.position),
+    );
+    const outgoingVelocity = new THREE.Vector3(...samples[25]!.position).sub(
+      new THREE.Vector3(...samples[24]!.position),
+    );
+
+    expect(
+      new THREE.Vector3(...samples[24]!.position).distanceTo(
+        new THREE.Vector3(...views[1]!.position),
+      ),
+    ).toBeLessThan(0.1);
+    expect(outgoingVelocity.sub(incomingVelocity).length()).toBeLessThan(0.1);
   });
 
   it("spreads indivisible leftover frames across control intervals", () => {
