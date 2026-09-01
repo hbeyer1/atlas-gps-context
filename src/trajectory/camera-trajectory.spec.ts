@@ -670,15 +670,61 @@ describe("sampleCameraPath", () => {
         directionMode,
         directionTarget: target,
       })) {
+        const quaternion = new THREE.Quaternion(...sample.quaternion);
         const actual = new THREE.Vector3(0, 0, -1)
-          .applyQuaternion(new THREE.Quaternion(...sample.quaternion))
+          .applyQuaternion(quaternion)
           .normalize();
         const expected = new THREE.Vector3(...target)
           .sub(new THREE.Vector3(...sample.position))
           .normalize()
           .multiplyScalar(directionMode === "look_at" ? 1 : -1);
+        const expectedUp = new THREE.Vector3(0, 1, 0)
+          .addScaledVector(actual, -actual.y)
+          .normalize();
+        const actualUp = new THREE.Vector3(0, 1, 0)
+          .applyQuaternion(quaternion)
+          .normalize();
         expect(actual.dot(expected)).toBeGreaterThan(0.999999);
+        expect(actualUp.dot(expectedUp)).toBeGreaterThan(0.999999);
       }
+    }
+  });
+
+  it("keeps a level point-target horizon near vertical shots", () => {
+    const target: [number, number, number] = [0, 10, 0];
+    const aims: [number, number][] = [
+      [0, 0],
+      [100, 70],
+      [-80, -60],
+    ];
+    const views = cameraViewsFromTrajectory(
+      [
+        [0.05, 0, 0],
+        [0.03, 1, 0.04],
+        [-0.04, 2, 0.02],
+      ],
+      START,
+    ).map((view, index) => ({
+      ...view,
+      quaternion: cameraQuaternionFromAim(...aims[index]!),
+      angleKey: true,
+    }));
+
+    for (const sample of sampleCameraPath(views, 9, {
+      directionMode: "look_at",
+      directionTarget: target,
+    })) {
+      const quaternion = new THREE.Quaternion(...sample.quaternion);
+      const forward = new THREE.Vector3(0, 0, -1)
+        .applyQuaternion(quaternion)
+        .normalize();
+      const expectedUp = new THREE.Vector3(0, 1, 0)
+        .addScaledVector(forward, -forward.y)
+        .normalize();
+      const actualUp = new THREE.Vector3(0, 1, 0)
+        .applyQuaternion(quaternion)
+        .normalize();
+      expect(actualUp.dot(expectedUp)).toBeGreaterThan(0.999999);
     }
   });
 

@@ -1595,6 +1595,10 @@ function cameraPresetQuaternion(
     closed,
     fallback,
   );
+  if (directionMode === "look_at" || directionMode === "look_away") {
+    // A fixed pole fallback keeps ignored per-camera angles from adding roll.
+    return cameraQuaternionFacingDirection(direction, new THREE.Quaternion());
+  }
   return alignCameraForward(
     quaternionAtPresetProgress(frame, progress),
     direction,
