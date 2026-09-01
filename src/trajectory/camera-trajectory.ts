@@ -45,6 +45,7 @@ export type TrajectorySpace = {
 };
 
 export const TRAJECTORY_FLOOR_Y = 0;
+export const TRAJECTORY_SMOOTHING_VERSION = 1;
 export const MAX_PIVOTS_PER_PART = 12;
 const MAX_POINTS_PER_DRAWN_PART = 5;
 const DRAW_POINT_SPACING = 0.18;
@@ -52,6 +53,8 @@ const POSITION_SMOOTHING_WEIGHTS = [1, 6, 15, 20, 15, 6, 1] as const;
 const POSITION_SMOOTHING_WEIGHT_TOTAL = 64;
 const POSITION_SMOOTHING_REFERENCE_FRAMES = 96;
 const POSITION_SMOOTHING_STEP = 1 / POSITION_SMOOTHING_REFERENCE_FRAMES;
+const POSITION_FAIRING_NEIGHBOR_WEIGHT = 0.2;
+const POSITION_FAIRING_PASSES = 2;
 const PRESET_ORIENTATION_REFERENCE_FRAMES = 128;
 
 export function trajectoryPathFromSegments(
@@ -107,6 +110,65 @@ function trajectoryPathEntries(
     });
   });
   return entries;
+}
+
+export function smoothTrajectorySegments(
+  segments: readonly TrajectorySegment[],
+): TrajectorySegment[] {
+  const smoothedPath = fairTrajectoryPoints(
+    trajectoryPathEntries(segments).map((entry) => entry.point),
+  );
+  let pathIndex = -1;
+  let previousPoint: TrajectoryPoint | null = null;
+
+  return segments.map((segment) => ({
+    ...segment,
+    points: segment.points.map((point) => {
+      if (!previousPoint || !sameTrajectoryPoint(point, previousPoint)) {
+        pathIndex += 1;
+      }
+      previousPoint = point;
+      return smoothedPath[pathIndex]!;
+    }),
+  }));
+}
+
+export function materializeTrajectorySmoothing(
+  segments: readonly TrajectorySegment[],
+  currentVersion: number,
+): { segments: TrajectorySegment[]; version: number } {
+  return {
+    segments:
+      currentVersion >= TRAJECTORY_SMOOTHING_VERSION
+        ? [...segments]
+        : smoothTrajectorySegments(segments),
+    version: TRAJECTORY_SMOOTHING_VERSION,
+  };
+}
+
+function fairTrajectoryPoints(
+  trajectoryPoints: readonly TrajectoryPoint[],
+): TrajectoryPoint[] {
+  if (trajectoryPoints.length < 3) return [...trajectoryPoints];
+
+  let points = trajectoryPoints.map((point) => new THREE.Vector3(...point));
+  for (let pass = 0; pass < POSITION_FAIRING_PASSES; pass += 1) {
+    const previous = points;
+    points = previous.map((point, index) => {
+      if (index === 0 || index === previous.length - 1) {
+        return point.clone();
+      }
+      return point
+        .clone()
+        .multiplyScalar(1 - 2 * POSITION_FAIRING_NEIGHBOR_WEIGHT)
+        .addScaledVector(previous[index - 1]!, POSITION_FAIRING_NEIGHBOR_WEIGHT)
+        .addScaledVector(
+          previous[index + 1]!,
+          POSITION_FAIRING_NEIGHBOR_WEIGHT,
+        );
+    });
+  }
+  return points.map((point) => point.toArray());
 }
 
 export function moveTrajectoryPoint(
@@ -871,15 +933,28 @@ export function cameraPathProgressAtFrame(
   const segmentCount = closedLoop ? viewCount : viewCount - 1;
   if (lastFrame < segmentCount) return index / lastFrame;
 
-  let segment = 0;
-  let segmentEnd = Math.round(lastFrame / segmentCount);
-  while (segment < segmentCount - 1 && index > segmentEnd) {
-    segment += 1;
-    segmentEnd = Math.round(((segment + 1) * lastFrame) / segmentCount);
+  const frameProgresses = Array.from(
+    { length: segmentCount + 1 },
+    (_, keyIndex) =>
+      Math.round((keyIndex * lastFrame) / segmentCount) / lastFrame,
+  );
+  const pathProgresses = frameProgresses.map(
+    (_, keyIndex) => keyIndex / segmentCount,
+  );
+  const frameProgress = index / lastFrame;
+  const endIndex = frameProgresses.findIndex(
+    (progress) => progress >= frameProgress,
+  );
+  if (endIndex <= 0) return 0;
+  if (Math.abs(frameProgresses[endIndex]! - frameProgress) < 1e-10) {
+    return pathProgresses[endIndex]!;
   }
-  const segmentStart = Math.round((segment * lastFrame) / segmentCount);
-  const amount = (index - segmentStart) / (segmentEnd - segmentStart);
-  return (segment + amount) / segmentCount;
+  return cubicHermiteAtProgress(
+    scalarSpline(frameProgresses, pathProgresses),
+    frameProgresses,
+    endIndex,
+    frameProgress,
+  );
 }
 
 type ScalarSpline = {

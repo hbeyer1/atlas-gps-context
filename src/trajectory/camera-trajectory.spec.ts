@@ -5,6 +5,7 @@ import {
   buildTargetCameras,
   cameraAimDegrees,
   cameraDrawingView,
+  cameraPathProgressAtFrame,
   cameraPathTarget,
   cameraQuaternionAtView,
   cameraQuaternionFromAim,
@@ -14,6 +15,7 @@ import {
   deleteTrajectoryPivot,
   frameTrajectorySpaceAboveFloor,
   insertTrajectoryPivot,
+  materializeTrajectorySmoothing,
   MAX_PIVOTS_PER_PART,
   moveTrajectoryPoint,
   projectTrajectoryPoint,
@@ -22,6 +24,7 @@ import {
   sampleCameraPath,
   setTrajectoryPointDirectionOverride,
   setTrajectoryPointQuaternion,
+  smoothTrajectorySegments,
   trajectoryFloorBoundary,
   trajectoryPathFromSegments,
   trajectoryPivotsFromSegments,
@@ -231,11 +234,13 @@ describe("sampleCameraPath", () => {
   });
 
   it("moves smoothly through uneven approximate camera positions", () => {
-    const views: CameraView[] = [0, 1, 11].map((x, index) => ({
-      ...START,
-      id: `position-${index + 1}`,
-      position: [x, 1, 0],
-    }));
+    const [segment] = smoothTrajectorySegments([
+      {
+        id: "rough-position-part",
+        points: [0, 1, 11].map((x): [number, number, number] => [x, 1, 0]),
+      },
+    ]);
+    const views = cameraViewsFromSegments([segment], START);
 
     const samples = sampleCameraPath(views, 49);
     const incomingVelocity = new THREE.Vector3(...samples[24]!.position).sub(
@@ -245,26 +250,143 @@ describe("sampleCameraPath", () => {
       new THREE.Vector3(...samples[24]!.position),
     );
 
-    expect(
-      new THREE.Vector3(...samples[24]!.position).distanceTo(
-        new THREE.Vector3(...views[1]!.position),
-      ),
-    ).toBeLessThan(0.1);
+    expect(samples[24]!.position[0]).toBeGreaterThan(3);
+    expect(samples[24]!.position[0]).toBeLessThan(4.5);
     expect(outgoingVelocity.sub(incomingVelocity).length()).toBeLessThan(0.1);
   });
 
-  it("spreads indivisible leftover frames across control intervals", () => {
-    const views = [0, 1, 2, 3].map((x, index): CameraView => ({
-      ...START,
-      id: `point-${index + 1}`,
-      position: [x, 1, 0],
-    }));
+  it("softens a rough multi-part flight without hiding its editable positions", () => {
+    const positions: [number, number, number][] = [
+      [21.65, 55.23, 23.28],
+      [-7.13, 15.91, -23.6],
+      [-3.39, 51.27, -33.56],
+      [-2.49, 74.46, -38.74],
+      [1.72, 87.63, -82.32],
+      [11.49, 84.94, -99.16],
+      [12.75, 77.23, -112.77],
+      [15.82, 68.46, -121.23],
+    ];
+    const partIndices = [
+      [0, 1, 2],
+      [2, 3],
+      [3, 4],
+      [4, 5, 6],
+      [6, 7],
+    ];
+    const segments = smoothTrajectorySegments(
+      partIndices.map((indices, partIndex) => ({
+        id: `rough-flight-part-${partIndex + 1}`,
+        points: indices.map((index) => positions[index]!),
+      })),
+    );
+    const views = cameraViewsFromSegments(segments, START);
+    const samples = sampleCameraPath(views, 96);
+    const velocities = samples
+      .slice(1)
+      .map((sample, index) =>
+        new THREE.Vector3(...sample.position).sub(
+          new THREE.Vector3(...samples[index]!.position),
+        ),
+      );
+    const accelerations = velocities
+      .slice(1)
+      .map((velocity, index) => velocity.clone().sub(velocities[index]!));
+    const jerks = accelerations
+      .slice(1)
+      .map((acceleration, index) =>
+        acceleration.clone().sub(accelerations[index]!),
+      );
+    const secondPivot = sampleCameraPivot(views, 1);
 
-    const samples = sampleCameraPath(views, 8);
+    expect(segments[0]!.points[0]).toEqual(positions[0]);
+    expect(segments.at(-1)!.points.at(-1)).toEqual(positions.at(-1));
+    expect(segments[0]!.points.at(-1)).toEqual(segments[1]!.points[0]);
+    expect(segments[0]!.points[1]![1]).toBeGreaterThan(35);
+    expect(
+      new THREE.Vector3(...secondPivot.position).distanceTo(
+        new THREE.Vector3(...views[1]!.position),
+      ),
+    ).toBeLessThan(1);
+    expect(
+      Math.min(...samples.map((sample) => sample.position[1])),
+    ).toBeGreaterThan(35);
+    expect(
+      Math.max(...accelerations.map((value) => value.length())),
+    ).toBeLessThan(0.5);
+    expect(Math.max(...jerks.map((value) => value.length()))).toBeLessThan(
+      0.2,
+    );
+  });
 
-    expect(samples[2]?.position).toEqual(views[1]?.position);
-    expect(samples[5]?.position).toEqual(views[2]?.position);
-    expect(samples[7]?.position).toEqual(views[3]?.position);
+  it("materializes path smoothing only once across preview and save", () => {
+    const preview = materializeTrajectorySmoothing(
+      [
+        {
+          id: "drawn-part",
+          points: [
+            [0, 1, 0],
+            [1, 8, 0],
+            [2, 1, 0],
+          ],
+        },
+      ],
+      0,
+    );
+    const saved = materializeTrajectorySmoothing(
+      preview.segments,
+      preview.version,
+    );
+
+    expect(saved.segments).toEqual(preview.segments);
+  });
+
+  it("does not move corrected points when the path is extended", () => {
+    const materialized = materializeTrajectorySmoothing(
+      [
+        {
+          id: "first-part",
+          points: [
+            [0, 1, 0],
+            [1, 8, 0],
+            [2, 1, 0],
+          ],
+        },
+      ],
+      0,
+    );
+    const lastPoint = materialized.segments[0]!.points.at(-1)!;
+    const extended = [
+      ...materialized.segments,
+      {
+        id: "second-part",
+        points: [lastPoint, [3, 3, 0] as [number, number, number]],
+      },
+    ];
+    const replayed = materializeTrajectorySmoothing(
+      extended,
+      materialized.version,
+    );
+
+    expect(replayed.segments[0]).toEqual(materialized.segments[0]);
+  });
+
+  it("keeps camera keys exact while smoothing indivisible frame timing", () => {
+    const progresses = Array.from({ length: 96 }, (_, index) =>
+      cameraPathProgressAtFrame(index, 96, 8),
+    );
+    const steps = progresses
+      .slice(1)
+      .map((progress, index) => progress - progresses[index]!);
+    const stepChanges = steps
+      .slice(1)
+      .map((step, index) => Math.abs(step - steps[index]!));
+
+    for (let keyIndex = 0; keyIndex < 8; keyIndex += 1) {
+      const frameIndex = Math.round((keyIndex * 95) / 7);
+      expect(progresses[frameIndex]).toBeCloseTo(keyIndex / 7);
+    }
+    expect(Math.max(...stepChanges)).toBeLessThan(0.0002);
+    expect(progresses.at(-1)).toBe(1);
   });
 
   it("moves periodically around a closed loop while facing inward", () => {
