@@ -9,6 +9,7 @@ import {
   cameraPathTarget,
   cameraQuaternionAtView,
   cameraQuaternionFromAim,
+  cameraTargetIsClearOfPath,
   cameraViewLookingAt,
   cameraViewsFromSegments,
   cameraViewsFromTrajectory,
@@ -20,6 +21,7 @@ import {
   moveTrajectoryPoint,
   projectTrajectoryPoint,
   projectCameraPreviewPoints,
+  reshapeTrajectorySegments,
   sampleCameraPivot,
   sampleCameraPath,
   setTrajectoryPointDirectionOverride,
@@ -313,9 +315,7 @@ describe("sampleCameraPath", () => {
     expect(
       Math.max(...accelerations.map((value) => value.length())),
     ).toBeLessThan(0.5);
-    expect(Math.max(...jerks.map((value) => value.length()))).toBeLessThan(
-      0.2,
-    );
+    expect(Math.max(...jerks.map((value) => value.length()))).toBeLessThan(0.2);
   });
 
   it("materializes path smoothing only once across preview and save", () => {
@@ -650,6 +650,59 @@ describe("sampleCameraPath", () => {
     ).toBeLessThan(1e-7);
   });
 
+  it("points every point-target camera at or away from the chosen target", () => {
+    const target: [number, number, number] = [2, 4, -8];
+    const views = cameraViewsFromTrajectory(
+      [
+        [-3, 1, 1],
+        [0, 2, 0],
+        [4, 1, 2],
+      ],
+      START,
+    ).map((view, index) => ({
+      ...view,
+      directionOverride:
+        index === 1 ? cameraQuaternionFromAim(160, -20) : undefined,
+    }));
+
+    for (const directionMode of ["look_at", "look_away"] as const) {
+      for (const sample of sampleCameraPath(views, 25, {
+        directionMode,
+        directionTarget: target,
+      })) {
+        const actual = new THREE.Vector3(0, 0, -1)
+          .applyQuaternion(new THREE.Quaternion(...sample.quaternion))
+          .normalize();
+        const expected = new THREE.Vector3(...target)
+          .sub(new THREE.Vector3(...sample.position))
+          .normalize()
+          .multiplyScalar(directionMode === "look_at" ? 1 : -1);
+        expect(actual.dot(expected)).toBeGreaterThan(0.999999);
+      }
+    }
+  });
+
+  it("rejects a look target that the camera path crosses", () => {
+    const views = cameraViewsFromTrajectory(
+      [
+        [-2, 1, 0],
+        [0, 1, 0],
+        [2, 1, 0],
+      ],
+      START,
+    );
+
+    expect(cameraTargetIsClearOfPath(views, [0, 1, 0], false, 0.05)).toBe(
+      false,
+    );
+    expect(cameraTargetIsClearOfPath(views, [0, 3, 0], false, 0.05)).toBe(true);
+
+    const offGridTarget = sampleCameraPath(views, 1000)[333]!.position;
+    expect(cameraTargetIsClearOfPath(views, offGridTarget, false, 0.001)).toBe(
+      false,
+    );
+  });
+
   it("uses the exact sampled pose for an uneven preset camera pivot", () => {
     const views = cameraViewsFromTrajectory(
       [
@@ -803,6 +856,129 @@ const TURNED_VIEW = cameraDrawingView(
 );
 
 describe("3D drawn camera paths", () => {
+  it("straightens one part without changing its joins or camera angles", () => {
+    const forward: [number, number, number, number] = [0, 0, 0, 1];
+    const parts: TrajectorySegment[] = [
+      {
+        id: "one",
+        points: [
+          [-2, 1, 0],
+          [0, 1, 0],
+        ],
+      },
+      {
+        id: "two",
+        points: [
+          [0, 1, 0],
+          [1, 4, 3],
+          [2, 2, -2],
+          [4, 1, 0],
+        ],
+        quaternions: [forward, null, null, forward],
+      },
+      {
+        id: "three",
+        points: [
+          [4, 1, 0],
+          [6, 1, 0],
+        ],
+      },
+    ];
+
+    const shaped = reshapeTrajectorySegments(
+      parts,
+      "straighten",
+      FRONT_VIEW,
+      "two",
+      false,
+    )!;
+
+    expect(shaped[0]).toBe(parts[0]);
+    expect(shaped[2]).toBe(parts[2]);
+    expect(shaped[1]?.points).toEqual([
+      [0, 1, 0],
+      [4 / 3, 1, 0],
+      [8 / 3, 1, 0],
+      [4, 1, 0],
+    ]);
+    expect(shaped[1]?.quaternions).toBe(parts[1]?.quaternions);
+  });
+
+  it("reshapes a whole closed path into an evenly spaced circle", () => {
+    const parts: TrajectorySegment[] = [
+      {
+        id: "one",
+        points: [
+          [4, 2, 0],
+          [1, 2, 2],
+          [-3, 2, 1],
+        ],
+      },
+      {
+        id: "two",
+        points: [
+          [-3, 2, 1],
+          [-1, 2, -4],
+          [3, 2, -2],
+          [4, 2, 0],
+        ],
+      },
+    ];
+
+    const shaped = reshapeTrajectorySegments(
+      parts,
+      "circular",
+      cameraDrawingView(
+        new THREE.Quaternion()
+          .setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2)
+          .toArray(),
+      ),
+      null,
+      true,
+    )!;
+    const path = trajectoryPathFromSegments(shaped);
+    const logicalPath = path.slice(0, -1);
+    const center = logicalPath
+      .reduce(
+        (sum, point) => sum.add(new THREE.Vector3(...point)),
+        new THREE.Vector3(),
+      )
+      .multiplyScalar(1 / logicalPath.length);
+    const radii = logicalPath.map((point) =>
+      new THREE.Vector3(...point).distanceTo(center),
+    );
+
+    expect(path).toHaveLength(6);
+    expect(path.at(-1)).toEqual(path[0]);
+    expect(shaped[0]?.points.at(-1)).toEqual(shaped[1]?.points[0]);
+    expect(Math.max(...radii) - Math.min(...radii)).toBeLessThan(1e-6);
+  });
+
+  it("flattens a selected part onto the current view plane", () => {
+    const parts: TrajectorySegment[] = [
+      {
+        id: "one",
+        points: [
+          [0, 2, 0],
+          [1, 3, 4],
+          [3, 4, -2],
+          [5, 2, 0],
+        ],
+      },
+    ];
+    const shaped = reshapeTrajectorySegments(
+      parts,
+      "flatten",
+      FRONT_VIEW,
+      "one",
+      false,
+    )!;
+
+    expect(shaped[0]?.points[0]).toEqual(parts[0]?.points[0]);
+    expect(shaped[0]?.points.at(-1)).toEqual(parts[0]?.points.at(-1));
+    expect(shaped[0]?.points.map((point) => point[2])).toEqual([0, 0, 0, 0]);
+  });
+
   it("adds a pivot on the virtual closing span without duplicating camera 1", () => {
     const parts: TrajectorySegment[] = [
       {

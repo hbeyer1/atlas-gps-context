@@ -11,7 +11,9 @@ export type CameraView = {
   directionOverride?: TrajectoryQuaternion;
 };
 
-export type CameraDirectionMode = "manual" | "forward" | "inward" | "outward";
+export type CameraDirectionMode =
+  "manual" | "forward" | "inward" | "outward" | "look_at" | "look_away";
+export type TrajectoryShape = "straighten" | "circular" | "flatten";
 export type CameraPathOptions = {
   directionMode?: CameraDirectionMode;
   directionTarget?: TrajectoryPoint;
@@ -129,6 +131,295 @@ export function smoothTrajectorySegments(
       }
       previousPoint = point;
       return smoothedPath[pathIndex]!;
+    }),
+  }));
+}
+
+export function reshapeTrajectorySegments(
+  segments: readonly TrajectorySegment[],
+  shape: TrajectoryShape,
+  view: TrajectoryDrawingView,
+  segmentId: string | null,
+  closedLoop: boolean,
+): TrajectorySegment[] | null {
+  const selectedIndex = segmentId
+    ? segments.findIndex((segment) => segment.id === segmentId)
+    : -1;
+  if (segmentId && selectedIndex < 0) return null;
+
+  const sourcePoints = segmentId
+    ? segments[selectedIndex]!.points
+    : trajectoryPathEntries(segments).map((entry) => entry.point);
+  const repeatedClosedEndpoint =
+    !segmentId &&
+    closedLoop &&
+    sourcePoints.length >= 4 &&
+    sameTrajectoryPoint(sourcePoints[0]!, sourcePoints.at(-1)!);
+  const shapeSourcePoints = repeatedClosedEndpoint
+    ? sourcePoints.slice(0, -1)
+    : sourcePoints;
+  if (
+    shapeSourcePoints.length < 3 ||
+    (!segmentId && closedLoop && shape === "straighten")
+  ) {
+    return null;
+  }
+  if (
+    shape === "circular" &&
+    !(!segmentId && closedLoop) &&
+    sameTrajectoryPoint(shapeSourcePoints[0]!, shapeSourcePoints.at(-1)!)
+  ) {
+    return null;
+  }
+
+  const shapedLogicalPoints =
+    shape === "straighten"
+      ? straightTrajectoryPoints(shapeSourcePoints)
+      : shape === "circular"
+        ? circularTrajectoryPoints(
+            shapeSourcePoints,
+            view,
+            !segmentId && closedLoop,
+          )
+        : flattenTrajectoryPoints(
+            shapeSourcePoints,
+            view,
+            !segmentId && closedLoop,
+          );
+  const shapedPoints = repeatedClosedEndpoint
+    ? [...shapedLogicalPoints, shapedLogicalPoints[0]!]
+    : shapedLogicalPoints;
+  if (
+    shapedPoints.some(
+      (point) =>
+        point.some((coordinate) => !Number.isFinite(coordinate)) ||
+        point[1] < TRAJECTORY_FLOOR_Y - 1e-6,
+    ) ||
+    shapedPoints.some(
+      (point, index) =>
+        index > 0 && sameTrajectoryPoint(point, shapedPoints[index - 1]!),
+    )
+  ) {
+    return null;
+  }
+
+  if (segmentId) {
+    return segments.map((segment, index) =>
+      index === selectedIndex ? { ...segment, points: shapedPoints } : segment,
+    );
+  }
+  return replaceTrajectoryPathPoints(segments, shapedPoints);
+}
+
+function straightTrajectoryPoints(
+  points: readonly TrajectoryPoint[],
+): TrajectoryPoint[] {
+  const start = new THREE.Vector3(...points[0]!);
+  const end = new THREE.Vector3(...points.at(-1)!);
+  return points.map((_, index) =>
+    start
+      .clone()
+      .lerp(end, index / (points.length - 1))
+      .toArray(),
+  );
+}
+
+function circularTrajectoryPoints(
+  points: readonly TrajectoryPoint[],
+  view: TrajectoryDrawingView,
+  closed: boolean,
+): TrajectoryPoint[] {
+  if (closed) return circularLoopTrajectoryPoints(points, view);
+
+  const start = new THREE.Vector3(...points[0]!);
+  const end = new THREE.Vector3(...points.at(-1)!);
+  const chord = end.clone().sub(start);
+  const chordLength = chord.length();
+  if (chordLength < 1e-5) return [...points];
+
+  const along = chord.clone().normalize();
+  const normal = trajectoryPlaneNormal(view, along);
+  const side = normal.clone().cross(along).normalize();
+  if (side.dot(new THREE.Vector3(...view.up)) < 0) side.negate();
+  const midpoint = start.clone().add(end).multiplyScalar(0.5);
+  const offsets = points.slice(1, -1).map((point, index) => {
+    const amount = (index + 1) / (points.length - 1);
+    const baseline = start.clone().lerp(end, amount);
+    return new THREE.Vector3(...point).sub(baseline).dot(side);
+  });
+  const measuredSagitta =
+    offsets.reduce((sum, offset) => sum + offset, 0) / offsets.length;
+  const sign = measuredSagitta < 0 ? -1 : 1;
+  const sagitta =
+    sign *
+    THREE.MathUtils.clamp(
+      Math.abs(measuredSagitta) < chordLength * 0.03
+        ? chordLength * 0.25
+        : Math.abs(measuredSagitta),
+      chordLength * 0.08,
+      chordLength * 0.75,
+    );
+  const halfChord = chordLength / 2;
+  const centerOffset =
+    (sagitta * sagitta - halfChord * halfChord) / (2 * sagitta);
+  const center = midpoint.clone().addScaledVector(side, centerOffset);
+  const startRadius = start.clone().sub(center);
+  const endRadius = end.clone().sub(center);
+  let sweep = Math.atan2(
+    normal.dot(startRadius.clone().cross(endRadius)),
+    startRadius.dot(endRadius),
+  );
+  const desiredMiddle = midpoint
+    .clone()
+    .addScaledVector(side, sagitta)
+    .sub(center)
+    .normalize();
+  const shortMiddle = startRadius
+    .clone()
+    .applyAxisAngle(normal, sweep / 2)
+    .normalize();
+  if (shortMiddle.dot(desiredMiddle) < 0.999) {
+    sweep += sweep < 0 ? Math.PI * 2 : -Math.PI * 2;
+  }
+
+  return points.map((_, index) => {
+    if (index === 0) return points[0]!;
+    if (index === points.length - 1) return points.at(-1)!;
+    return center
+      .clone()
+      .add(
+        startRadius
+          .clone()
+          .applyAxisAngle(normal, (sweep * index) / (points.length - 1)),
+      )
+      .toArray();
+  });
+}
+
+function circularLoopTrajectoryPoints(
+  points: readonly TrajectoryPoint[],
+  view: TrajectoryDrawingView,
+): TrajectoryPoint[] {
+  const normal = new THREE.Vector3(...view.forward).normalize();
+  const center = points
+    .reduce(
+      (sum, point) => sum.add(new THREE.Vector3(...point)),
+      new THREE.Vector3(),
+    )
+    .multiplyScalar(1 / points.length);
+  const right = new THREE.Vector3(...view.right)
+    .addScaledVector(normal, -new THREE.Vector3(...view.right).dot(normal))
+    .normalize();
+  const up = normal.clone().cross(right).normalize();
+  if (up.dot(new THREE.Vector3(...view.up)) < 0) up.negate();
+  const projected = points.map((point) => {
+    const offset = new THREE.Vector3(...point).sub(center);
+    return new THREE.Vector2(offset.dot(right), offset.dot(up));
+  });
+  const radius = Math.max(
+    1e-4,
+    projected.reduce((sum, point) => sum + point.length(), 0) / points.length,
+  );
+  const startAngle =
+    projected[0]!.lengthSq() > 1e-8
+      ? Math.atan2(projected[0]!.y, projected[0]!.x)
+      : 0;
+  const signedArea = projected.reduce((area, point, index) => {
+    const next = projected[(index + 1) % projected.length]!;
+    return area + point.x * next.y - point.y * next.x;
+  }, 0);
+  const direction = signedArea < 0 ? -1 : 1;
+  const shaped = points.map((_, index) => {
+    const angle =
+      startAngle + (direction * Math.PI * 2 * index) / points.length;
+    return center
+      .clone()
+      .addScaledVector(right, Math.cos(angle) * radius)
+      .addScaledVector(up, Math.sin(angle) * radius);
+  });
+  const floorShift = Math.max(
+    0,
+    TRAJECTORY_FLOOR_Y - Math.min(...shaped.map((point) => point.y)),
+  );
+  return shaped.map((point) => {
+    point.y += floorShift;
+    return point.toArray();
+  });
+}
+
+function flattenTrajectoryPoints(
+  points: readonly TrajectoryPoint[],
+  view: TrajectoryDrawingView,
+  closed: boolean,
+): TrajectoryPoint[] {
+  const start = new THREE.Vector3(...points[0]!);
+  const end = new THREE.Vector3(...points.at(-1)!);
+  const chord = end.clone().sub(start);
+  const origin = closed
+    ? points
+        .reduce(
+          (sum, point) => sum.add(new THREE.Vector3(...point)),
+          new THREE.Vector3(),
+        )
+        .multiplyScalar(1 / points.length)
+    : start;
+  const normal = trajectoryPlaneNormal(
+    view,
+    chord.lengthSq() > 1e-10 ? chord.normalize() : null,
+  );
+  const shaped = points.map((point) => {
+    const projected = new THREE.Vector3(...point);
+    projected.addScaledVector(
+      normal,
+      -projected.clone().sub(origin).dot(normal),
+    );
+    return projected;
+  });
+  if (closed) {
+    const floorShift = Math.max(
+      0,
+      TRAJECTORY_FLOOR_Y - Math.min(...shaped.map((point) => point.y)),
+    );
+    return shaped.map((point) => {
+      point.y += floorShift;
+      return point.toArray();
+    });
+  }
+  return shaped.map((point, index) => {
+    if (index === 0) return points[0]!;
+    if (index === points.length - 1) return points.at(-1)!;
+    return point.toArray();
+  });
+}
+
+function trajectoryPlaneNormal(
+  view: TrajectoryDrawingView,
+  along: THREE.Vector3 | null,
+): THREE.Vector3 {
+  const candidates = [view.forward, view.up, view.right].map((axis) =>
+    new THREE.Vector3(...axis).normalize(),
+  );
+  for (const candidate of candidates) {
+    if (along) candidate.addScaledVector(along, -candidate.dot(along));
+    if (candidate.lengthSq() > 1e-8) return candidate.normalize();
+  }
+  return new THREE.Vector3(0, 1, 0);
+}
+
+function replaceTrajectoryPathPoints(
+  segments: readonly TrajectorySegment[],
+  points: readonly TrajectoryPoint[],
+): TrajectorySegment[] {
+  let pathIndex = -1;
+  let previousPoint: TrajectoryPoint | null = null;
+  return segments.map((segment) => ({
+    ...segment,
+    points: segment.points.map((point) => {
+      if (!previousPoint || !sameTrajectoryPoint(point, previousPoint)) {
+        pathIndex += 1;
+      }
+      previousPoint = point;
+      return points[pathIndex]!;
     }),
   }));
 }
@@ -803,7 +1094,10 @@ export function sampleCameraPath(
     ),
   );
   const target =
-    directionMode === "inward" || directionMode === "outward"
+    directionMode === "inward" ||
+    directionMode === "outward" ||
+    directionMode === "look_at" ||
+    directionMode === "look_away"
       ? cameraDirectionTarget(pathViews, directionTarget)
       : null;
   const presetOrientationFrame =
@@ -818,7 +1112,9 @@ export function sampleCameraPath(
           orientationKeys,
         );
   const presetOverrideDeltas =
-    directionMode === "manual"
+    directionMode === "manual" ||
+    directionMode === "look_at" ||
+    directionMode === "look_away"
       ? null
       : cameraPresetOverrideDeltas(
           pathViews,
@@ -885,6 +1181,47 @@ export function sampleCameraPath(
       fovRadians,
     };
   });
+}
+
+export function cameraTargetIsClearOfPath(
+  views: readonly CameraView[],
+  target: TrajectoryPoint,
+  closedLoop: boolean,
+  clearance: number,
+): boolean {
+  if (views.length < 2) return true;
+  const path = normalizedCameraPath(views, closedLoop);
+  const curve = cameraPathCurve(path.views, path.closed);
+  const subdivisionCount = Math.max(256, path.views.length * 64);
+  const targetVector = new THREE.Vector3(...target);
+  const closest = new THREE.Vector3();
+  let previous = cameraPositionAtProgress(
+    path.views,
+    curve,
+    0,
+    path.closed,
+    true,
+    false,
+  );
+  for (let index = 1; index <= subdivisionCount; index += 1) {
+    const progress = index / subdivisionCount;
+    const current = cameraPositionAtProgress(
+      path.views,
+      curve,
+      progress,
+      path.closed,
+      false,
+      index === subdivisionCount,
+    );
+    new THREE.Line3(previous, current).closestPointToPoint(
+      targetVector,
+      true,
+      closest,
+    );
+    if (closest.distanceTo(targetVector) <= clearance) return false;
+    previous = current;
+  }
+  return true;
 }
 
 export function sampleCameraPivot(
@@ -1485,7 +1822,7 @@ function radialCameraDirection(
   target: THREE.Vector3,
   directionMode: CameraDirectionMode,
 ): THREE.Vector3 {
-  return directionMode === "outward"
+  return directionMode === "outward" || directionMode === "look_away"
     ? position.clone().sub(target)
     : target.clone().sub(position);
 }
