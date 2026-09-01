@@ -8,8 +8,15 @@ export type CameraView = {
   quaternion: [number, number, number, number];
   fovRadians: number;
   angleKey?: boolean;
+  directionOverride?: TrajectoryQuaternion;
 };
 
+export type CameraDirectionMode = "manual" | "forward" | "inward" | "outward";
+export type CameraPathOptions = {
+  directionMode?: CameraDirectionMode;
+  directionTarget?: TrajectoryPoint;
+  closedLoop?: boolean;
+};
 export type SampledCameraView = Omit<CameraView, "angleKey" | "id">;
 export type DrawPoint = [number, number];
 export type TrajectoryPoint = [number, number, number];
@@ -23,6 +30,7 @@ export type TrajectorySegment = {
   id: string;
   points: TrajectoryPoint[];
   quaternions?: (TrajectoryQuaternion | null)[] | null;
+  direction_overrides?: (TrajectoryQuaternion | null)[] | null;
 };
 export type TrajectoryPivot = {
   segmentId: string;
@@ -44,6 +52,7 @@ const POSITION_SMOOTHING_WEIGHTS = [1, 6, 15, 20, 15, 6, 1] as const;
 const POSITION_SMOOTHING_WEIGHT_TOTAL = 64;
 const POSITION_SMOOTHING_REFERENCE_FRAMES = 96;
 const POSITION_SMOOTHING_STEP = 1 / POSITION_SMOOTHING_REFERENCE_FRAMES;
+const PRESET_ORIENTATION_REFERENCE_FRAMES = 128;
 
 export function trajectoryPathFromSegments(
   segments: readonly TrajectorySegment[],
@@ -59,13 +68,14 @@ export function trajectoryPivotsFromSegments(
     pointIndex: entry.pointIndex,
     pivotNumber: index + 1,
     position: entry.point,
-    hasCameraAngle: Boolean(entry.quaternion),
+    hasCameraAngle: Boolean(entry.quaternion || entry.directionOverride),
   }));
 }
 
 type TrajectoryPathEntry = {
   point: TrajectoryPoint;
   quaternion: TrajectoryQuaternion | null;
+  directionOverride: TrajectoryQuaternion | null;
   segmentIndex: number;
   pointIndex: number;
 };
@@ -77,13 +87,23 @@ function trajectoryPathEntries(
   segments.forEach((segment, segmentIndex) => {
     segment.points.forEach((point, pointIndex) => {
       const quaternion = segment.quaternions?.[pointIndex] ?? null;
+      const directionOverride =
+        segment.direction_overrides?.[pointIndex] ?? null;
       const previous = entries.at(-1);
       if (previous && sameTrajectoryPoint(point, previous.point)) {
         if (!previous.quaternion && quaternion)
           previous.quaternion = quaternion;
+        if (!previous.directionOverride && directionOverride)
+          previous.directionOverride = directionOverride;
         return;
       }
-      entries.push({ point, quaternion, segmentIndex, pointIndex });
+      entries.push({
+        point,
+        quaternion,
+        directionOverride,
+        segmentIndex,
+        pointIndex,
+      });
     });
   });
   return entries;
@@ -183,7 +203,10 @@ export function deleteTrajectoryPivot(
     const quaternions = current.quaternions
       ? current.quaternions.filter((_, index) => !indexes.has(index))
       : current.quaternions;
-    return [{ ...current, points, quaternions }];
+    const direction_overrides = current.direction_overrides
+      ? current.direction_overrides.filter((_, index) => !indexes.has(index))
+      : current.direction_overrides;
+    return [{ ...current, points, quaternions, direction_overrides }];
   });
 }
 
@@ -192,6 +215,37 @@ export function setTrajectoryPointQuaternion(
   segmentId: string,
   pointIndex: number,
   quaternion: TrajectoryQuaternion,
+): TrajectorySegment[] {
+  return setTrajectoryPointOrientation(
+    segments,
+    segmentId,
+    pointIndex,
+    quaternion,
+    "quaternions",
+  );
+}
+
+export function setTrajectoryPointDirectionOverride(
+  segments: readonly TrajectorySegment[],
+  segmentId: string,
+  pointIndex: number,
+  quaternion: TrajectoryQuaternion,
+): TrajectorySegment[] {
+  return setTrajectoryPointOrientation(
+    segments,
+    segmentId,
+    pointIndex,
+    quaternion,
+    "direction_overrides",
+  );
+}
+
+function setTrajectoryPointOrientation(
+  segments: readonly TrajectorySegment[],
+  segmentId: string,
+  pointIndex: number,
+  quaternion: TrajectoryQuaternion,
+  field: "quaternions" | "direction_overrides",
 ): TrajectorySegment[] {
   const segmentIndex = segments.findIndex(
     (segment) => segment.id === segmentId,
@@ -219,11 +273,11 @@ export function setTrajectoryPointQuaternion(
     }
     if (quaternionIndex === null) return current;
 
-    const quaternions = current.points.map(
-      (_, index) => current.quaternions?.[index] ?? null,
+    const orientations = current.points.map(
+      (_, index) => current[field]?.[index] ?? null,
     );
-    quaternions[quaternionIndex] = normalized;
-    return { ...current, quaternions };
+    orientations[quaternionIndex] = normalized;
+    return { ...current, [field]: orientations };
   });
 }
 
@@ -231,37 +285,45 @@ export function insertTrajectoryPivot(
   segments: readonly TrajectorySegment[],
   position: TrajectoryPoint,
   curveProgress: number,
+  closedLoop = false,
 ): {
   segments: TrajectorySegment[];
   segmentId: string;
   pointIndex: number;
   pivotNumber: number;
 } | null {
-  const entries = trajectoryPathEntries(segments);
+  const normalizedSegments = closedLoop
+    ? normalizeClosedTrajectorySegments(segments)
+    : [...segments];
+  const entries = trajectoryPathEntries(normalizedSegments);
   const path = entries.map((entry) => entry.point);
   if (path.length < 2) return null;
+  const closed = closedLoop && path.length >= 3;
   const clampedCurveProgress = THREE.MathUtils.clamp(curveProgress, 0, 1);
+  const spanCount = closed ? path.length : path.length - 1;
   const spanIndex = Math.min(
-    Math.floor(clampedCurveProgress * (path.length - 1)),
-    path.length - 2,
+    Math.floor(clampedCurveProgress * spanCount),
+    spanCount - 1,
   );
-  const owner = entries[spanIndex + 1];
+  const closingSpan = closed && spanIndex === path.length - 1;
+  const owner = closingSpan ? entries.at(-1) : entries[spanIndex + 1];
   if (!owner) return null;
-  const segment = segments[owner.segmentIndex]!;
+  const segment = normalizedSegments[owner.segmentIndex]!;
   if (segment.points.length >= MAX_PIVOTS_PER_PART) return null;
   const nextPosition: TrajectoryPoint = [
     position[0],
     Math.max(TRAJECTORY_FLOOR_Y, position[1]),
     position[2],
   ];
-  const pointIndex = owner.pointIndex;
+  const pointIndex = owner.pointIndex + (closingSpan ? 1 : 0);
+  const nextPathPoint = closingSpan ? path[0]! : path[spanIndex + 1]!;
   if (
     sameTrajectoryPoint(nextPosition, path[spanIndex]!) ||
-    sameTrajectoryPoint(nextPosition, path[spanIndex + 1]!)
+    sameTrajectoryPoint(nextPosition, nextPathPoint)
   ) {
     return null;
   }
-  const nextSegments = segments.map((current, index) => {
+  const nextSegments = normalizedSegments.map((current, index) => {
     if (index !== owner.segmentIndex) return current;
     const quaternions = current.quaternions
       ? [
@@ -270,6 +332,13 @@ export function insertTrajectoryPivot(
           ...current.quaternions.slice(pointIndex),
         ]
       : current.quaternions;
+    const direction_overrides = current.direction_overrides
+      ? [
+          ...current.direction_overrides.slice(0, pointIndex),
+          null,
+          ...current.direction_overrides.slice(pointIndex),
+        ]
+      : current.direction_overrides;
     return {
       ...current,
       points: [
@@ -278,6 +347,7 @@ export function insertTrajectoryPivot(
         ...current.points.slice(pointIndex),
       ],
       quaternions,
+      direction_overrides,
     };
   });
   return {
@@ -286,6 +356,26 @@ export function insertTrajectoryPivot(
     pointIndex,
     pivotNumber: spanIndex + 2,
   };
+}
+
+export function normalizeClosedTrajectorySegments(
+  segments: readonly TrajectorySegment[],
+): TrajectorySegment[] {
+  const entries = trajectoryPathEntries(segments);
+  if (
+    entries.length < 3 ||
+    !sameTrajectoryPoint(entries[0]!.point, entries.at(-1)!.point)
+  ) {
+    return [...segments];
+  }
+  const duplicate = entries.at(-1)!;
+  return (
+    deleteTrajectoryPivot(
+      segments,
+      segments[duplicate.segmentIndex]!.id,
+      duplicate.pointIndex,
+    ) ?? [...segments]
+  );
 }
 
 function sameTrajectoryPoint(
@@ -303,13 +393,10 @@ export function cameraViewLookingAt(
   target: [number, number, number],
   fovRadians: number,
 ): CameraView {
-  const camera = new THREE.PerspectiveCamera();
-  camera.position.set(...position);
-  camera.lookAt(new THREE.Vector3(...target));
   return {
     id,
     position,
-    quaternion: camera.quaternion.toArray(),
+    quaternion: cameraQuaternionLookingAt(position, target).toArray(),
     fovRadians,
   };
 }
@@ -535,22 +622,17 @@ export function cameraViewsFromSegments(
     ...view,
     quaternion: entries[index]!.quaternion ?? reference.quaternion,
     angleKey: Boolean(entries[index]!.quaternion),
+    directionOverride: entries[index]!.directionOverride ?? undefined,
   }));
 }
 
 export function cameraQuaternionAtView(
   views: readonly CameraView[],
   viewIndex: number,
+  options: CameraPathOptions = {},
 ): TrajectoryQuaternion {
   if (views.length === 0) return [0, 0, 0, 1];
-  if (views.length === 1) return views[0]!.quaternion;
-
-  const orientationKeys = cameraOrientationKeys(views);
-  const index = THREE.MathUtils.clamp(viewIndex, 0, views.length - 1);
-  return quaternionAtProgress(
-    orientationKeys,
-    index / (views.length - 1),
-  ).toArray();
+  return sampleCameraPivot(views, viewIndex, options).quaternion;
 }
 
 export function cameraAimDegrees(quaternion: TrajectoryQuaternion): {
@@ -621,44 +703,103 @@ export function projectCameraPreviewPoints(
   return projected;
 }
 
-/** Sample a smooth path using the manually chosen camera angles. */
+/** Sample a smooth path using the chosen camera direction behavior. */
 export function sampleCameraPath(
   views: readonly CameraView[],
   frameCount: number,
+  options: CameraPathOptions = {},
 ): SampledCameraView[] {
   if (views.length < 2 || frameCount < 1) return [];
 
-  const curve = new THREE.CatmullRomCurve3(
-    views.map((view) => new THREE.Vector3(...floorSafePosition(view.position))),
-    false,
-    "centripetal",
-  );
-  const orientationKeys = cameraOrientationKeys(views);
-  const segmentCount = views.length - 1;
-  const constantFovRadians = views.every(
-    (view) => view.fovRadians === views[0]!.fovRadians,
+  const {
+    directionMode = "manual",
+    directionTarget,
+    closedLoop = false,
+  } = options;
+  const path = normalizedCameraPath(views, closedLoop);
+  const pathViews = path.views;
+  const closed = path.closed;
+  const curve = cameraPathCurve(pathViews, closed);
+  const orientationKeys = cameraOrientationKeys(pathViews, closed);
+  const segmentCount = closed ? pathViews.length : pathViews.length - 1;
+  const constantFovRadians = pathViews.every(
+    (view) => view.fovRadians === pathViews[0]!.fovRadians,
   )
-    ? views[0]!.fovRadians
+    ? pathViews[0]!.fovRadians
     : null;
-  let previousQuaternion = orientationKeys.quaternions[0]!.clone();
+  const progresses = Array.from({ length: frameCount }, (_, index) =>
+    cameraPathProgressAtFrame(index, frameCount, pathViews.length, closed),
+  );
+  const positions = progresses.map((curveProgress, index) =>
+    cameraPositionAtProgress(
+      pathViews,
+      curve,
+      curveProgress,
+      closed,
+      index === 0,
+      index === frameCount - 1,
+    ),
+  );
+  const target =
+    directionMode === "inward" || directionMode === "outward"
+      ? cameraDirectionTarget(pathViews, directionTarget)
+      : null;
+  const presetOrientationFrame =
+    directionMode === "manual"
+      ? null
+      : cameraPresetOrientationFrame(
+          pathViews,
+          curve,
+          directionMode,
+          target,
+          closed,
+          orientationKeys,
+        );
+  const presetOverrideDeltas =
+    directionMode === "manual"
+      ? null
+      : cameraPresetOverrideDeltas(
+          pathViews,
+          curve,
+          directionMode,
+          target,
+          closed,
+          orientationKeys,
+          presetOrientationFrame!,
+        );
+  let previousQuaternion: THREE.Quaternion | null = null;
 
-  const samples = Array.from({ length: frameCount }, (_, index) => {
-    const curveProgress = cameraPathProgressAtFrame(
-      index,
-      frameCount,
-      views.length,
-    );
-    const position =
-      index === 0
-        ? new THREE.Vector3(...floorSafePosition(views[0]!.position))
-        : index === frameCount - 1
-          ? new THREE.Vector3(...floorSafePosition(views.at(-1)!.position))
-          : smoothCurvePoint(curve, curveProgress);
+  return progresses.map((curveProgress, index) => {
+    const position = positions[index]!;
     const viewProgress = curveProgress * segmentCount;
     const segment = Math.min(Math.floor(viewProgress), segmentCount - 1);
     const amount = THREE.MathUtils.clamp(viewProgress - segment, 0, 1);
-    const quaternion = quaternionAtProgress(orientationKeys, curveProgress);
-    if (previousQuaternion.dot(quaternion) < 0) {
+    const manualQuaternion = quaternionAtProgress(
+      orientationKeys,
+      curveProgress,
+    );
+    const presetQuaternion =
+      directionMode === "manual"
+        ? null
+        : cameraPresetQuaternion(
+            curve,
+            curveProgress,
+            position,
+            directionMode,
+            target,
+            closed,
+            manualQuaternion,
+            presetOrientationFrame!,
+          );
+    const quaternion = presetQuaternion
+      ? presetDeltaAtProgress(
+          presetOverrideDeltas,
+          curveProgress,
+          pathViews.length,
+          closed,
+        ).multiply(presetQuaternion)
+      : manualQuaternion;
+    if (previousQuaternion && previousQuaternion.dot(quaternion) < 0) {
       quaternion.set(
         -quaternion.x,
         -quaternion.y,
@@ -666,12 +807,13 @@ export function sampleCameraPath(
         -quaternion.w,
       );
     }
-    previousQuaternion = quaternion;
+    previousQuaternion = quaternion.clone();
     const fovRadians =
       constantFovRadians ??
       THREE.MathUtils.lerp(
-        views[segment]!.fovRadians,
-        views[segment + 1]!.fovRadians,
+        pathViews[segment]!.fovRadians,
+        pathViews[closed ? (segment + 1) % pathViews.length : segment + 1]!
+          .fovRadians,
         amount,
       );
 
@@ -681,19 +823,52 @@ export function sampleCameraPath(
       fovRadians,
     };
   });
-  return samples;
+}
+
+export function sampleCameraPivot(
+  views: readonly CameraView[],
+  viewIndex: number,
+  options: CameraPathOptions = {},
+): SampledCameraView {
+  if (views.length === 0) {
+    return {
+      position: [0, TRAJECTORY_FLOOR_Y, 0],
+      quaternion: [0, 0, 0, 1],
+      fovRadians: Math.PI / 3,
+    };
+  }
+  if (views.length === 1) {
+    return {
+      position: floorSafePosition(views[0]!.position),
+      quaternion: views[0]!.quaternion,
+      fovRadians: views[0]!.fovRadians,
+    };
+  }
+
+  const path = normalizedCameraPath(views, options.closedLoop ?? false);
+  const samples = sampleCameraPath(
+    views,
+    path.closed ? path.views.length + 1 : path.views.length,
+    options,
+  );
+  const sampleIndex =
+    path.views.length < views.length && viewIndex === views.length - 1
+      ? path.views.length
+      : THREE.MathUtils.clamp(viewIndex, 0, path.views.length - 1);
+  return samples[sampleIndex]!;
 }
 
 export function cameraPathProgressAtFrame(
   frameIndex: number,
   frameCount: number,
   viewCount: number,
+  closedLoop = false,
 ): number {
   if (frameCount <= 1 || viewCount <= 1) return 0;
 
   const lastFrame = frameCount - 1;
   const index = THREE.MathUtils.clamp(frameIndex, 0, lastFrame);
-  const segmentCount = viewCount - 1;
+  const segmentCount = closedLoop ? viewCount : viewCount - 1;
   if (lastFrame < segmentCount) return index / lastFrame;
 
   let segment = 0;
@@ -720,6 +895,7 @@ type CameraOrientationKeys = {
 
 function cameraOrientationKeys(
   views: readonly CameraView[],
+  closed = false,
 ): CameraOrientationKeys {
   const explicitKeyIndices = views.flatMap((view, index) =>
     view.angleKey ? [index] : [],
@@ -728,9 +904,24 @@ function cameraOrientationKeys(
     explicitKeyIndices.length > 0
       ? explicitKeyIndices
       : views.map((_, index) => index);
-  const quaternions = keyIndices.map((index) =>
+  const baseQuaternions = keyIndices.map((index) =>
     new THREE.Quaternion(...views[index]!.quaternion).normalize(),
   );
+  const baseProgresses = keyIndices.map((index) =>
+    closed ? index / views.length : index / (views.length - 1),
+  );
+  const quaternions =
+    closed && baseQuaternions.length > 1
+      ? [-1, 0, 1].flatMap(() =>
+          baseQuaternions.map((quaternion) => quaternion.clone()),
+        )
+      : baseQuaternions;
+  const progresses =
+    closed && baseProgresses.length > 1
+      ? [-1, 0, 1].flatMap((offset) =>
+          baseProgresses.map((progress) => progress + offset),
+        )
+      : baseProgresses;
   for (let index = 1; index < quaternions.length; index += 1) {
     const previous = quaternions[index - 1]!;
     const current = quaternions[index]!;
@@ -738,7 +929,6 @@ function cameraOrientationKeys(
       current.set(-current.x, -current.y, -current.z, -current.w);
     }
   }
-  const progresses = keyIndices.map((index) => index / (views.length - 1));
   return {
     quaternions,
     progresses,
@@ -768,18 +958,8 @@ function quaternionAtProgress(
   if (aimSpline) {
     return new THREE.Quaternion(
       ...cameraQuaternionFromAim(
-        cubicHermiteAtProgress(
-          aimSpline.yaw,
-          progresses,
-          endIndex,
-          progress,
-        ),
-        cubicHermiteAtProgress(
-          aimSpline.pitch,
-          progresses,
-          endIndex,
-          progress,
-        ),
+        cubicHermiteAtProgress(aimSpline.yaw, progresses, endIndex, progress),
+        cubicHermiteAtProgress(aimSpline.pitch, progresses, endIndex, progress),
       ),
     );
   }
@@ -803,12 +983,13 @@ function cameraAimSpline(
   const aims = quaternions.map((quaternion) =>
     cameraAimDegrees(quaternion.toArray()),
   );
-  const hasRoll = quaternions.some((quaternion, index) =>
-    quaternion.angleTo(
-      new THREE.Quaternion(
-        ...cameraQuaternionFromAim(aims[index]!.yaw, aims[index]!.pitch),
-      ),
-    ) > 1e-5,
+  const hasRoll = quaternions.some(
+    (quaternion, index) =>
+      quaternion.angleTo(
+        new THREE.Quaternion(
+          ...cameraQuaternionFromAim(aims[index]!.yaw, aims[index]!.pitch),
+        ),
+      ) > 1e-5,
   );
   if (hasRoll) return null;
 
@@ -849,9 +1030,9 @@ function monotoneCubicSlopes(
   progresses: readonly number[],
   values: readonly number[],
 ): number[] {
-  const intervalWidths = values.slice(1).map(
-    (_, index) => progresses[index + 1]! - progresses[index]!,
-  );
+  const intervalWidths = values
+    .slice(1)
+    .map((_, index) => progresses[index + 1]! - progresses[index]!);
   const intervalSlopes = intervalWidths.map(
     (width, index) => (values[index + 1]! - values[index]!) / width,
   );
@@ -888,8 +1069,7 @@ function cubicHermiteAtProgress(
   const amountSquared = amount * amount;
   const amountCubed = amountSquared * amount;
   return (
-    (2 * amountCubed - 3 * amountSquared + 1) *
-      spline.values[startIndex]! +
+    (2 * amountCubed - 3 * amountSquared + 1) * spline.values[startIndex]! +
     (amountCubed - 2 * amountSquared + amount) *
       width *
       spline.slopes[startIndex]! +
@@ -901,8 +1081,9 @@ function cubicHermiteAtProgress(
 function smoothCurvePoint(
   curve: THREE.CatmullRomCurve3,
   progress: number,
+  periodic = false,
 ): THREE.Vector3 {
-  if (progress <= 0 || progress >= 1) {
+  if (!periodic && (progress <= 0 || progress >= 1)) {
     return floorSafeCurvePoint(curve, THREE.MathUtils.clamp(progress, 0, 1));
   }
 
@@ -910,7 +1091,18 @@ function smoothCurvePoint(
   POSITION_SMOOTHING_WEIGHTS.forEach((weight, index) => {
     const offset = index - Math.floor(POSITION_SMOOTHING_WEIGHTS.length / 2);
     point.addScaledVector(
-      extendedCurvePoint(curve, progress + offset * POSITION_SMOOTHING_STEP),
+      periodic
+        ? floorSafeCurvePoint(
+            curve,
+            THREE.MathUtils.euclideanModulo(
+              progress + offset * POSITION_SMOOTHING_STEP,
+              1,
+            ),
+          )
+        : extendedCurvePoint(
+            curve,
+            progress + offset * POSITION_SMOOTHING_STEP,
+          ),
       weight / POSITION_SMOOTHING_WEIGHT_TOTAL,
     );
   });
@@ -950,13 +1142,404 @@ function floorSafePosition(
   return [position[0], Math.max(TRAJECTORY_FLOOR_Y, position[1]), position[2]];
 }
 
+function cameraPositionAtProgress(
+  views: readonly CameraView[],
+  curve: THREE.CatmullRomCurve3,
+  progress: number,
+  closed: boolean,
+  firstFrame: boolean,
+  lastFrame: boolean,
+): THREE.Vector3 {
+  if (!closed && firstFrame) {
+    return new THREE.Vector3(...floorSafePosition(views[0]!.position));
+  }
+  if (!closed && lastFrame) {
+    return new THREE.Vector3(...floorSafePosition(views.at(-1)!.position));
+  }
+  return smoothCurvePoint(curve, progress, closed);
+}
+
+type CameraPresetOrientationFrame = {
+  progresses: number[];
+  quaternions: THREE.Quaternion[];
+};
+
+function cameraPresetQuaternion(
+  curve: THREE.CatmullRomCurve3,
+  progress: number,
+  position: THREE.Vector3,
+  directionMode: Exclude<CameraDirectionMode, "manual">,
+  target: THREE.Vector3 | null,
+  closed: boolean,
+  fallback: THREE.Quaternion,
+  frame: CameraPresetOrientationFrame,
+): THREE.Quaternion {
+  const direction = cameraPresetDirection(
+    curve,
+    progress,
+    position,
+    directionMode,
+    target,
+    closed,
+    fallback,
+  );
+  return alignCameraForward(
+    quaternionAtPresetProgress(frame, progress),
+    direction,
+  );
+}
+
+function cameraPresetOverrideDeltas(
+  views: readonly CameraView[],
+  curve: THREE.CatmullRomCurve3,
+  directionMode: Exclude<CameraDirectionMode, "manual">,
+  target: THREE.Vector3 | null,
+  closed: boolean,
+  orientationKeys: CameraOrientationKeys,
+  frame: CameraPresetOrientationFrame,
+): THREE.Quaternion[] | null {
+  if (!views.some((view) => view.directionOverride)) return null;
+
+  return views.map((view, index) => {
+    if (!view.directionOverride) return new THREE.Quaternion();
+    const progress = closed ? index / views.length : index / (views.length - 1);
+    const position = cameraPositionAtProgress(
+      views,
+      curve,
+      progress,
+      closed,
+      index === 0,
+      index === views.length - 1,
+    );
+    const fallback = quaternionAtProgress(orientationKeys, progress);
+    const base = cameraPresetQuaternion(
+      curve,
+      progress,
+      position,
+      directionMode,
+      target,
+      closed,
+      fallback,
+      frame,
+    );
+    return new THREE.Quaternion(...view.directionOverride)
+      .normalize()
+      .multiply(base.invert());
+  });
+}
+
+function cameraPresetOrientationFrame(
+  views: readonly CameraView[],
+  curve: THREE.CatmullRomCurve3,
+  directionMode: Exclude<CameraDirectionMode, "manual">,
+  target: THREE.Vector3 | null,
+  closed: boolean,
+  orientationKeys: CameraOrientationKeys,
+): CameraPresetOrientationFrame {
+  const pivotProgresses = views.map((_, index) =>
+    closed ? index / views.length : index / (views.length - 1),
+  );
+  const progresses = [
+    ...Array.from(
+      { length: PRESET_ORIENTATION_REFERENCE_FRAMES + 1 },
+      (_, index) => index / PRESET_ORIENTATION_REFERENCE_FRAMES,
+    ),
+    ...pivotProgresses,
+  ]
+    .sort((first, second) => first - second)
+    .filter(
+      (progress, index, values) =>
+        index === 0 || Math.abs(progress - values[index - 1]!) > 1e-10,
+    );
+  const directions = progresses.map((progress) => {
+    const position = cameraPositionAtProgress(
+      views,
+      curve,
+      progress,
+      closed,
+      progress === 0,
+      progress === 1,
+    );
+    return cameraPresetDirection(
+      curve,
+      progress,
+      position,
+      directionMode,
+      target,
+      closed,
+      quaternionAtProgress(orientationKeys, progress),
+    );
+  });
+  const quaternions = transportedCameraQuaternions(
+    directions,
+    progresses,
+    quaternionAtProgress(orientationKeys, 0),
+    closed,
+  );
+  return { progresses, quaternions };
+}
+
+function cameraPresetDirection(
+  curve: THREE.CatmullRomCurve3,
+  progress: number,
+  position: THREE.Vector3,
+  directionMode: Exclude<CameraDirectionMode, "manual">,
+  target: THREE.Vector3 | null,
+  closed: boolean,
+  fallback: THREE.Quaternion,
+): THREE.Vector3 {
+  const direction =
+    directionMode === "forward"
+      ? smoothCurveDirection(curve, progress, closed)
+      : target
+        ? radialCameraDirection(position, target, directionMode)
+        : new THREE.Vector3();
+  if (direction.lengthSq() > 1e-10) return direction.normalize();
+  return new THREE.Vector3(0, 0, -1).applyQuaternion(fallback).normalize();
+}
+
+function transportedCameraQuaternions(
+  directions: readonly THREE.Vector3[],
+  progresses: readonly number[],
+  fallback: THREE.Quaternion,
+  closed: boolean,
+): THREE.Quaternion[] {
+  const quaternions = [
+    cameraQuaternionFacingDirection(directions[0]!, fallback),
+  ];
+  for (let index = 1; index < directions.length; index += 1) {
+    const previous = quaternions[index - 1]!;
+    const transported = directionRotation(
+      directions[index - 1]!,
+      directions[index]!,
+      previous,
+    ).multiply(previous.clone());
+    if (previous.dot(transported) < 0) negateQuaternion(transported);
+    quaternions.push(transported.normalize());
+  }
+  if (closed) {
+    closeTransportedQuaternionLoop(quaternions, directions, progresses);
+  }
+  return quaternions;
+}
+
+function closeTransportedQuaternionLoop(
+  quaternions: THREE.Quaternion[],
+  directions: readonly THREE.Vector3[],
+  progresses: readonly number[],
+): void {
+  const correction = quaternions[0]!
+    .clone()
+    .multiply(quaternions.at(-1)!.clone().invert())
+    .normalize();
+  if (correction.w < 0) negateQuaternion(correction);
+  const signedHalfAngle = new THREE.Vector3(
+    correction.x,
+    correction.y,
+    correction.z,
+  ).dot(directions[0]!);
+  const twist = 2 * Math.atan2(signedHalfAngle, correction.w);
+  quaternions.forEach((quaternion, index) => {
+    const roll = new THREE.Quaternion().setFromAxisAngle(
+      directions[index]!,
+      twist * progresses[index]!,
+    );
+    quaternion.premultiply(roll).normalize();
+    if (index > 0 && quaternions[index - 1]!.dot(quaternion) < 0) {
+      negateQuaternion(quaternion);
+    }
+  });
+}
+
+function quaternionAtPresetProgress(
+  frame: CameraPresetOrientationFrame,
+  progress: number,
+): THREE.Quaternion {
+  const clamped = THREE.MathUtils.clamp(progress, 0, 1);
+  const endIndex = frame.progresses.findIndex((value) => value >= clamped);
+  if (endIndex <= 0) return frame.quaternions[0]!.clone();
+  if (Math.abs(frame.progresses[endIndex]! - clamped) < 1e-10) {
+    return frame.quaternions[endIndex]!.clone();
+  }
+  const startProgress = frame.progresses[endIndex - 1]!;
+  const amount =
+    (clamped - startProgress) / (frame.progresses[endIndex]! - startProgress);
+  return new THREE.Quaternion().slerpQuaternions(
+    frame.quaternions[endIndex - 1]!,
+    frame.quaternions[endIndex]!,
+    amount,
+  );
+}
+
+function presetDeltaAtProgress(
+  deltas: readonly THREE.Quaternion[] | null,
+  progress: number,
+  viewCount: number,
+  closed: boolean,
+): THREE.Quaternion {
+  if (!deltas) return new THREE.Quaternion();
+
+  const segmentCount = closed ? viewCount : viewCount - 1;
+  const viewProgress = THREE.MathUtils.clamp(progress, 0, 1) * segmentCount;
+  const segment = Math.min(Math.floor(viewProgress), segmentCount - 1);
+  const amount = THREE.MathUtils.clamp(viewProgress - segment, 0, 1);
+  const easedAmount = amount * amount * (3 - 2 * amount);
+  return new THREE.Quaternion().slerpQuaternions(
+    deltas[segment]!,
+    deltas[closed ? (segment + 1) % viewCount : segment + 1]!,
+    easedAmount,
+  );
+}
+
+function cameraDirectionTarget(
+  views: readonly CameraView[],
+  directionTarget?: TrajectoryPoint,
+): THREE.Vector3 {
+  if (directionTarget) return new THREE.Vector3(...directionTarget);
+
+  const target = views.reduce(
+    (sum, view) =>
+      sum.add(new THREE.Vector3(...floorSafePosition(view.position))),
+    new THREE.Vector3(),
+  );
+  return target.multiplyScalar(1 / views.length);
+}
+
+function radialCameraDirection(
+  position: THREE.Vector3,
+  target: THREE.Vector3,
+  directionMode: CameraDirectionMode,
+): THREE.Vector3 {
+  return directionMode === "outward"
+    ? position.clone().sub(target)
+    : target.clone().sub(position);
+}
+
+function normalizedCameraPath(
+  views: readonly CameraView[],
+  closedLoop: boolean,
+): { views: readonly CameraView[]; closed: boolean } {
+  if (!closedLoop || views.length < 3) return { views, closed: false };
+  if (!sameTrajectoryPoint(views[0]!.position, views.at(-1)!.position)) {
+    return { views, closed: true };
+  }
+
+  const withoutDuplicateEndpoint = views.slice(0, -1);
+  return withoutDuplicateEndpoint.length >= 3
+    ? { views: withoutDuplicateEndpoint, closed: true }
+    : { views, closed: false };
+}
+
+function cameraPathCurve(
+  views: readonly CameraView[],
+  closed: boolean,
+): THREE.CatmullRomCurve3 {
+  return new THREE.CatmullRomCurve3(
+    views.map((view) => new THREE.Vector3(...floorSafePosition(view.position))),
+    closed,
+    "centripetal",
+  );
+}
+
+function smoothCurveDirection(
+  curve: THREE.CatmullRomCurve3,
+  progress: number,
+  periodic: boolean,
+): THREE.Vector3 {
+  const start = periodic
+    ? progress - POSITION_SMOOTHING_STEP
+    : Math.max(0, progress - POSITION_SMOOTHING_STEP);
+  const end = periodic
+    ? progress + POSITION_SMOOTHING_STEP
+    : Math.min(1, progress + POSITION_SMOOTHING_STEP);
+  const direction = smoothCurvePoint(curve, end, periodic).sub(
+    smoothCurvePoint(curve, start, periodic),
+  );
+  return direction.lengthSq() > 1e-10
+    ? direction
+    : curve.getTangent(THREE.MathUtils.clamp(progress, 0, 1));
+}
+
+function cameraQuaternionFacingDirection(
+  direction: THREE.Vector3,
+  fallback: THREE.Quaternion,
+): THREE.Quaternion {
+  const forward = direction.clone().normalize();
+  let up = new THREE.Vector3(0, 1, 0);
+  if (Math.abs(up.dot(forward)) > 0.98) {
+    up = new THREE.Vector3(0, 1, 0).applyQuaternion(fallback);
+    up.addScaledVector(forward, -up.dot(forward));
+    if (up.lengthSq() <= 1e-10) {
+      up = new THREE.Vector3(1, 0, 0);
+      up.addScaledVector(forward, -up.dot(forward));
+    }
+  }
+  const camera = new THREE.PerspectiveCamera();
+  camera.up.copy(up.normalize());
+  camera.lookAt(forward);
+  return camera.quaternion.normalize();
+}
+
+function alignCameraForward(
+  quaternion: THREE.Quaternion,
+  direction: THREE.Vector3,
+): THREE.Quaternion {
+  const currentDirection = new THREE.Vector3(0, 0, -1).applyQuaternion(
+    quaternion,
+  );
+  return directionRotation(currentDirection, direction, quaternion)
+    .multiply(quaternion)
+    .normalize();
+}
+
+function directionRotation(
+  from: THREE.Vector3,
+  to: THREE.Vector3,
+  orientation: THREE.Quaternion,
+): THREE.Quaternion {
+  const start = from.clone().normalize();
+  const end = to.clone().normalize();
+  if (start.dot(end) > -0.999999) {
+    return new THREE.Quaternion().setFromUnitVectors(start, end);
+  }
+
+  const up = new THREE.Vector3(0, 1, 0).applyQuaternion(orientation);
+  up.addScaledVector(start, -up.dot(start));
+  if (up.lengthSq() <= 1e-10) {
+    up.set(1, 0, 0).addScaledVector(start, -start.x);
+  }
+  return new THREE.Quaternion().setFromAxisAngle(up.normalize(), Math.PI);
+}
+
+function negateQuaternion(quaternion: THREE.Quaternion): THREE.Quaternion {
+  return quaternion.set(
+    -quaternion.x,
+    -quaternion.y,
+    -quaternion.z,
+    -quaternion.w,
+  );
+}
+
+function cameraQuaternionLookingAt(
+  position: readonly [number, number, number],
+  target: THREE.Vector3 | readonly [number, number, number],
+): THREE.Quaternion {
+  const camera = new THREE.PerspectiveCamera();
+  camera.position.set(...position);
+  camera.lookAt(
+    target instanceof THREE.Vector3 ? target : new THREE.Vector3(...target),
+  );
+  return camera.quaternion;
+}
+
 export function buildTargetCameras(
   views: readonly CameraView[],
   frameCount: number,
   width: number,
   height: number,
+  options: CameraPathOptions = {},
 ): PinholeCamera[] {
-  return sampleCameraPath(views, frameCount).map((view) => ({
+  return sampleCameraPath(views, frameCount, options).map((view) => ({
     intrinsics: createIntrinsicsFromFov(
       THREE.MathUtils.radToDeg(view.fovRadians),
       width,

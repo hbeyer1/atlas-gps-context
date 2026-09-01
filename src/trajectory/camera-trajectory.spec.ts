@@ -18,7 +18,9 @@ import {
   moveTrajectoryPoint,
   projectTrajectoryPoint,
   projectCameraPreviewPoints,
+  sampleCameraPivot,
   sampleCameraPath,
+  setTrajectoryPointDirectionOverride,
   setTrajectoryPointQuaternion,
   trajectoryFloorBoundary,
   trajectoryPathFromSegments,
@@ -120,13 +122,15 @@ describe("sampleCameraPath", () => {
 
     const samples = sampleCameraPath(views, 49);
     const largestStep = Math.max(
-      ...samples.slice(1).map((sample, index) =>
-        THREE.MathUtils.radToDeg(
-          new THREE.Quaternion(...samples[index]!.quaternion).angleTo(
-            new THREE.Quaternion(...sample.quaternion),
+      ...samples
+        .slice(1)
+        .map((sample, index) =>
+          THREE.MathUtils.radToDeg(
+            new THREE.Quaternion(...samples[index]!.quaternion).angleTo(
+              new THREE.Quaternion(...sample.quaternion),
+            ),
           ),
         ),
-      ),
     );
 
     expect(largestStep).toBeLessThan(2);
@@ -262,6 +266,287 @@ describe("sampleCameraPath", () => {
     expect(samples[5]?.position).toEqual(views[2]?.position);
     expect(samples[7]?.position).toEqual(views[3]?.position);
   });
+
+  it("moves periodically around a closed loop while facing inward", () => {
+    const center = new THREE.Vector3(0, 1, 0);
+    const views = cameraViewsFromTrajectory(
+      [
+        [4, 1, 0],
+        [0, 1, 4],
+        [-4, 1, 0],
+        [0, 1, -4],
+      ],
+      START,
+    );
+    const samples = sampleCameraPath(views, 97, {
+      directionMode: "inward",
+      directionTarget: [0, 1, 0],
+      closedLoop: true,
+    });
+    const velocities = samples
+      .slice(1)
+      .map((sample, index) =>
+        new THREE.Vector3(...sample.position)
+          .sub(new THREE.Vector3(...samples[index]!.position))
+          .normalize(),
+      );
+    const interiorVelocityDots = velocities
+      .slice(1)
+      .map((velocity, index) => velocity.dot(velocities[index]!));
+    const seamVelocityDot = velocities.at(-1)!.dot(velocities[0]!);
+
+    expect(
+      new THREE.Vector3(...samples[0]!.position).distanceTo(
+        new THREE.Vector3(...samples.at(-1)!.position),
+      ),
+    ).toBeLessThan(1e-8);
+    expect(seamVelocityDot).toBeGreaterThanOrEqual(
+      Math.min(...interiorVelocityDots) - 1e-8,
+    );
+    for (const sample of samples) {
+      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(
+        new THREE.Quaternion(...sample.quaternion),
+      );
+      const inward = center
+        .clone()
+        .sub(new THREE.Vector3(...sample.position))
+        .normalize();
+      expect(forward.dot(inward)).toBeGreaterThan(0.999);
+    }
+  });
+
+  it("keeps camera roll continuous through vertical loop poles", () => {
+    const views = cameraViewsFromTrajectory(
+      [
+        [4, 5, 0],
+        [0, 9, 0],
+        [-4, 5, 0],
+        [0, 1, 0],
+      ],
+      START,
+    );
+    const samples = sampleCameraPath(views, 129, {
+      directionMode: "inward",
+      directionTarget: [0, 5, 0],
+      closedLoop: true,
+    });
+    const angularSteps = samples
+      .slice(1)
+      .map((sample, index) =>
+        new THREE.Quaternion(...samples[index]!.quaternion).angleTo(
+          new THREE.Quaternion(...sample.quaternion),
+        ),
+      );
+
+    expect(Math.max(...angularSteps)).toBeLessThan(0.2);
+    expect(
+      new THREE.Quaternion(...samples[0]!.quaternion).angleTo(
+        new THREE.Quaternion(...samples.at(-1)!.quaternion),
+      ),
+    ).toBeLessThan(1e-7);
+  });
+
+  it("normalizes a duplicated endpoint before sampling a closed loop", () => {
+    const uniqueViews = cameraViewsFromTrajectory(
+      [
+        [4, 1, 0],
+        [0, 1, 4],
+        [-4, 1, 0],
+        [0, 1, -4],
+      ],
+      START,
+    );
+    const duplicatedViews = [
+      ...uniqueViews,
+      { ...uniqueViews[0]!, id: "duplicate-end" },
+    ];
+    const options = { directionMode: "forward" as const, closedLoop: true };
+
+    expect(sampleCameraPath(duplicatedViews, 97, options)).toEqual(
+      sampleCameraPath(uniqueViews, 97, options),
+    );
+  });
+
+  it("keeps manual camera directions on a closed loop", () => {
+    const views = cameraViewsFromTrajectory(
+      [
+        [4, 1, 0],
+        [0, 1, 4],
+        [-4, 1, 0],
+        [0, 1, -4],
+      ],
+      START,
+    ).map((view, index) => ({ ...view, angleKey: index === 0 }));
+
+    for (const sample of sampleCameraPath(views, 49, { closedLoop: true })) {
+      expect(
+        Math.abs(
+          new THREE.Quaternion(...sample.quaternion).dot(
+            new THREE.Quaternion(...START.quaternion),
+          ),
+        ),
+      ).toBeCloseTo(1);
+    }
+  });
+
+  it("interpolates partial manual angle keys periodically across a loop seam", () => {
+    const views = cameraViewsFromTrajectory(
+      [
+        [4, 1, 0],
+        [0, 1, 4],
+        [-4, 1, 0],
+        [0, 1, -4],
+      ],
+      START,
+    ).map((view, index) => ({
+      ...view,
+      quaternion:
+        index === 1
+          ? cameraQuaternionFromAim(-45, 5)
+          : index === 2
+            ? cameraQuaternionFromAim(70, -10)
+            : view.quaternion,
+      angleKey: index === 1 || index === 2,
+    }));
+    const samples = sampleCameraPath(views, 97, { closedLoop: true });
+    const angularSteps = samples
+      .slice(1)
+      .map((sample, index) =>
+        new THREE.Quaternion(...samples[index]!.quaternion).angleTo(
+          new THREE.Quaternion(...sample.quaternion),
+        ),
+      );
+
+    expect(
+      new THREE.Quaternion(...samples[0]!.quaternion).angleTo(
+        new THREE.Quaternion(...samples.at(-1)!.quaternion),
+      ),
+    ).toBeLessThan(1e-7);
+    expect(
+      Math.max(angularSteps[0]!, angularSteps.at(-1)!),
+    ).toBeLessThanOrEqual(Math.max(...angularSteps.slice(1, -1)) + 1e-7);
+  });
+
+  it("offers forward and outward camera direction presets", () => {
+    const views = cameraViewsFromTrajectory(
+      [
+        [3, 1, -2],
+        [3, 1, 0],
+        [3, 1, 2],
+      ],
+      START,
+    );
+    const forward = sampleCameraPath(views, 17, {
+      directionMode: "forward",
+    })[8]!;
+    const outward = sampleCameraPath(views, 17, {
+      directionMode: "outward",
+      directionTarget: [0, 1, 0],
+    })[8]!;
+    const forwardDirection = new THREE.Vector3(0, 0, -1).applyQuaternion(
+      new THREE.Quaternion(...forward.quaternion),
+    );
+    const outwardDirection = new THREE.Vector3(0, 0, -1).applyQuaternion(
+      new THREE.Quaternion(...outward.quaternion),
+    );
+
+    expect(forwardDirection.z).toBeGreaterThan(0.999);
+    expect(outwardDirection.x).toBeGreaterThan(0.999);
+  });
+
+  it("keeps a preset automatic except around an overridden camera", () => {
+    const views = cameraViewsFromTrajectory(
+      [
+        [-5, 1, -2],
+        [-2, 3, 0],
+        [1, 2, 3],
+        [4, 1, 1],
+        [7, 2, -1],
+      ],
+      START,
+    );
+    const desired = cameraQuaternionFromAim(-110, 12);
+    const overridden = views.map((view, index) => ({
+      ...view,
+      directionOverride: index === 3 ? desired : undefined,
+    }));
+    const options = { directionMode: "forward" as const };
+    const basePivotSamples = sampleCameraPath(views, views.length, options);
+    const overriddenPivotSamples = sampleCameraPath(
+      overridden,
+      overridden.length,
+      options,
+    );
+    const baseDenseSamples = sampleCameraPath(views, 9, options);
+    const overriddenDenseSamples = sampleCameraPath(overridden, 9, options);
+
+    expect(
+      new THREE.Quaternion(...overriddenPivotSamples[3]!.quaternion).angleTo(
+        new THREE.Quaternion(...desired),
+      ),
+    ).toBeLessThan(1e-7);
+    for (const index of [0, 1, 2, 4]) {
+      expect(
+        new THREE.Quaternion(
+          ...overriddenPivotSamples[index]!.quaternion,
+        ).angleTo(new THREE.Quaternion(...basePivotSamples[index]!.quaternion)),
+      ).toBeLessThan(1e-7);
+    }
+    expect(
+      new THREE.Quaternion(...overriddenDenseSamples[1]!.quaternion).angleTo(
+        new THREE.Quaternion(...baseDenseSamples[1]!.quaternion),
+      ),
+    ).toBeLessThan(1e-7);
+  });
+
+  it("applies an override exactly at the inward target", () => {
+    const first = cameraQuaternionFromAim(0, 0);
+    const last = cameraQuaternionFromAim(30, 0);
+    const desired = cameraQuaternionFromAim(90, -10);
+    const views = cameraViewsFromTrajectory(
+      [
+        [-2, 1, 0],
+        [0, 1, 0],
+        [2, 1, 0],
+      ],
+      START,
+    ).map((view, index) => ({
+      ...view,
+      quaternion: index === 0 ? first : index === 2 ? last : view.quaternion,
+      angleKey: index === 0 || index === 2,
+      directionOverride: index === 1 ? desired : undefined,
+    }));
+    const middle = sampleCameraPath(views, 3, {
+      directionMode: "inward",
+      directionTarget: [0, 1, 0],
+    })[1]!;
+
+    expect(
+      new THREE.Quaternion(...middle.quaternion).angleTo(
+        new THREE.Quaternion(...desired),
+      ),
+    ).toBeLessThan(1e-7);
+  });
+
+  it("uses the exact sampled pose for an uneven preset camera pivot", () => {
+    const views = cameraViewsFromTrajectory(
+      [
+        [5, 1, 0],
+        [1, 4, 2],
+        [-2, 1, 5],
+        [-6, 2, -1],
+      ],
+      START,
+    );
+    const options = {
+      directionMode: "inward" as const,
+      directionTarget: [0, 1, 0] as [number, number, number],
+      closedLoop: true,
+    };
+    const expected = sampleCameraPath(views, views.length + 1, options)[2]!;
+
+    expect(sampleCameraPivot(views, 2, options)).toEqual(expected);
+  });
 });
 
 describe("buildTargetCameras", () => {
@@ -396,6 +681,86 @@ const TURNED_VIEW = cameraDrawingView(
 );
 
 describe("3D drawn camera paths", () => {
+  it("adds a pivot on the virtual closing span without duplicating camera 1", () => {
+    const parts: TrajectorySegment[] = [
+      {
+        id: "one",
+        points: [
+          [3, 1, 0],
+          [0, 1, 3],
+          [-3, 1, 0],
+        ],
+      },
+    ];
+
+    const inserted = insertTrajectoryPivot(parts, [0, 1, -3], 0.9, true)!;
+    const path = trajectoryPathFromSegments(inserted.segments);
+
+    expect(path).toEqual([
+      [3, 1, 0],
+      [0, 1, 3],
+      [-3, 1, 0],
+      [0, 1, -3],
+    ]);
+    expect(inserted.pivotNumber).toBe(4);
+  });
+
+  it("removes a duplicated loop endpoint before adding a closing-span pivot", () => {
+    const parts: TrajectorySegment[] = [
+      {
+        id: "one",
+        points: [
+          [3, 1, 0],
+          [0, 1, 3],
+          [-3, 1, 0],
+          [0, 1, -3],
+          [3, 1, 0],
+        ],
+      },
+    ];
+
+    const inserted = insertTrajectoryPivot(parts, [2, 1, -2], 0.9, true)!;
+
+    expect(trajectoryPathFromSegments(inserted.segments)).toEqual([
+      [3, 1, 0],
+      [0, 1, 3],
+      [-3, 1, 0],
+      [0, 1, -3],
+      [2, 1, -2],
+    ]);
+    expect(inserted.pivotNumber).toBe(5);
+  });
+
+  it("stores a preset override on both copies of a shared path point", () => {
+    const left: [number, number, number, number] = [
+      0,
+      Math.SQRT1_2,
+      0,
+      Math.SQRT1_2,
+    ];
+    const parts: TrajectorySegment[] = [
+      {
+        id: "one",
+        points: [
+          [0, 1, 0],
+          [1, 1, 0],
+        ],
+      },
+      {
+        id: "two",
+        points: [
+          [1, 1, 0],
+          [2, 1, 0],
+        ],
+      },
+    ];
+
+    const updated = setTrajectoryPointDirectionOverride(parts, "one", 1, left);
+
+    expect(updated[0]?.direction_overrides).toEqual([null, left]);
+    expect(updated[1]?.direction_overrides).toEqual([left, null]);
+  });
+
   it("deletes an interior camera position and its facing key", () => {
     const forward: [number, number, number, number] = [0, 0, 0, 1];
     const left: [number, number, number, number] = [
@@ -413,6 +778,7 @@ describe("3D drawn camera paths", () => {
           [2, 1, 0],
         ],
         quaternions: [forward, left, forward],
+        direction_overrides: [left, forward, left],
       },
     ];
 
@@ -426,6 +792,7 @@ describe("3D drawn camera paths", () => {
           [2, 1, 0],
         ],
         quaternions: [forward, forward],
+        direction_overrides: [left, left],
       },
     ]);
     expect(parts[0]?.points).toHaveLength(3);
@@ -495,6 +862,7 @@ describe("3D drawn camera paths", () => {
           [10, 1, 0],
         ],
         quaternions: [forward, left],
+        direction_overrides: [left, forward],
       },
       {
         id: "two",
@@ -519,6 +887,11 @@ describe("3D drawn camera paths", () => {
     ]);
     expect(inserted?.segments[1]).toBe(parts[1]);
     expect(inserted?.segments[0]?.quaternions).toEqual([forward, null, left]);
+    expect(inserted?.segments[0]?.direction_overrides).toEqual([
+      left,
+      null,
+      forward,
+    ]);
     expect(parts[0]?.points).toHaveLength(2);
   });
 
