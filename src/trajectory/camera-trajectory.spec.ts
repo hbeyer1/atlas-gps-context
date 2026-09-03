@@ -19,6 +19,7 @@ import {
   materializeTrajectorySmoothing,
   MAX_PIVOTS_PER_PART,
   moveTrajectoryPoint,
+  partLookAtTargetIsClearOfPath,
   projectTrajectoryPoint,
   projectCameraPreviewPoints,
   reshapeTrajectorySegments,
@@ -688,6 +689,130 @@ describe("sampleCameraPath", () => {
         expect(actualUp.dot(expectedUp)).toBeGreaterThan(0.999999);
       }
     }
+  });
+
+  it("aims one path part at a point and eases its neighboring parts", () => {
+    const target: [number, number, number] = [0, 1, 4];
+    const segments: TrajectorySegment[] = [
+      {
+        id: "before",
+        points: [
+          [-4, 1, 0],
+          [-2, 1, 0],
+        ],
+      },
+      {
+        id: "targeted",
+        points: [
+          [-2, 1, 0],
+          [0, 1, 0],
+          [2, 1, 0],
+        ],
+        look_at_target: target,
+      },
+      {
+        id: "after",
+        points: [
+          [2, 1, 0],
+          [4, 1, 0],
+        ],
+      },
+    ];
+    const views = cameraViewsFromSegments(segments, START);
+    const samples = sampleCameraPath(views, 129);
+
+    for (const index of [32, 48, 64, 80, 96]) {
+      const sample = samples[index]!;
+      const actual = new THREE.Vector3(0, 0, -1)
+        .applyQuaternion(new THREE.Quaternion(...sample.quaternion))
+        .normalize();
+      const expected = new THREE.Vector3(...target)
+        .sub(new THREE.Vector3(...sample.position))
+        .normalize();
+      expect(actual.dot(expected)).toBeGreaterThan(0.999999);
+    }
+
+    for (const index of [0, 16, 112, 128]) {
+      expect(
+        new THREE.Quaternion(...samples[index]!.quaternion).angleTo(
+          new THREE.Quaternion(...START.quaternion),
+        ),
+      ).toBeLessThan(1e-7);
+    }
+
+    const angularSteps = samples
+      .slice(1)
+      .map((sample, index) =>
+        new THREE.Quaternion(...samples[index]!.quaternion).angleTo(
+          new THREE.Quaternion(...sample.quaternion),
+        ),
+      );
+    expect(Math.max(...angularSteps)).toBeLessThan(0.5);
+    const closed = sampleCameraPath(views, 161, { closedLoop: true });
+    const closedBaseline = sampleCameraPath(
+      views.map(({ lookAtTarget: _lookAtTarget, ...view }) => view),
+      161,
+      { closedLoop: true },
+    );
+    expect(
+      new THREE.Quaternion(...closed[144]!.quaternion).angleTo(
+        new THREE.Quaternion(...closedBaseline[144]!.quaternion),
+      ),
+    ).toBeLessThan(1e-7);
+    expect(views.map((view) => view.lookAtTarget)).toEqual([
+      undefined,
+      target,
+      target,
+      undefined,
+      undefined,
+    ]);
+    expect(
+      trajectoryPivotsFromSegments(segments).map(
+        (pivot) => pivot.hasLookAtTarget,
+      ),
+    ).toEqual([false, true, true, true, false]);
+  });
+
+  it("checks a part target only where that target affects the camera", () => {
+    const segments: TrajectorySegment[] = [
+      {
+        id: "crossing",
+        points: [
+          [-2, 1, 0],
+          [2, 1, 0],
+        ],
+      },
+      {
+        id: "gap",
+        points: [
+          [2, 1, 0],
+          [2, 1, -2],
+        ],
+      },
+      {
+        id: "targeted",
+        points: [
+          [2, 1, -2],
+          [3, 1, -3],
+          [4, 1, -4],
+        ],
+      },
+    ];
+    const baselineViews = cameraViewsFromSegments(segments, START);
+    const target = sampleCameraPath(baselineViews, 1000)[100]!.position;
+    const views = cameraViewsFromSegments(
+      segments.map((segment) =>
+        segment.id === "targeted"
+          ? { ...segment, look_at_target: target }
+          : segment,
+      ),
+      START,
+    );
+
+    expect(cameraTargetIsClearOfPath(views, target, false, 0.05)).toBe(false);
+    expect(partLookAtTargetIsClearOfPath(views, target, false, 0.05)).toBe(
+      true,
+    );
   });
 
   it("keeps a level point-target horizon near vertical shots", () => {

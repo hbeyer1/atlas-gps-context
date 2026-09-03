@@ -9,6 +9,7 @@ export type CameraView = {
   fovRadians: number;
   angleKey?: boolean;
   directionOverride?: TrajectoryQuaternion;
+  lookAtTarget?: TrajectoryPoint;
 };
 
 export type CameraDirectionMode =
@@ -19,7 +20,10 @@ export type CameraPathOptions = {
   directionTarget?: TrajectoryPoint;
   closedLoop?: boolean;
 };
-export type SampledCameraView = Omit<CameraView, "angleKey" | "id">;
+export type SampledCameraView = Omit<
+  CameraView,
+  "angleKey" | "directionOverride" | "id" | "lookAtTarget"
+>;
 export type DrawPoint = [number, number];
 export type TrajectoryPoint = [number, number, number];
 export type TrajectoryQuaternion = [number, number, number, number];
@@ -33,6 +37,7 @@ export type TrajectorySegment = {
   points: TrajectoryPoint[];
   quaternions?: (TrajectoryQuaternion | null)[] | null;
   direction_overrides?: (TrajectoryQuaternion | null)[] | null;
+  look_at_target?: TrajectoryPoint | null;
 };
 export type TrajectoryPivot = {
   segmentId: string;
@@ -40,6 +45,7 @@ export type TrajectoryPivot = {
   pivotNumber: number;
   position: TrajectoryPoint;
   hasCameraAngle: boolean;
+  hasLookAtTarget: boolean;
 };
 export type TrajectorySpace = {
   center: TrajectoryPoint;
@@ -68,12 +74,16 @@ export function trajectoryPathFromSegments(
 export function trajectoryPivotsFromSegments(
   segments: readonly TrajectorySegment[],
 ): TrajectoryPivot[] {
-  return trajectoryPathEntries(segments).map((entry, index) => ({
+  const entries = trajectoryPathEntries(segments);
+  return entries.map((entry, index) => ({
     segmentId: segments[entry.segmentIndex]!.id,
     pointIndex: entry.pointIndex,
     pivotNumber: index + 1,
     position: entry.point,
     hasCameraAngle: Boolean(entry.quaternion || entry.directionOverride),
+    hasLookAtTarget: Boolean(
+      entry.lookAtTarget || entries[index - 1]?.lookAtTarget,
+    ),
   }));
 }
 
@@ -81,6 +91,7 @@ type TrajectoryPathEntry = {
   point: TrajectoryPoint;
   quaternion: TrajectoryQuaternion | null;
   directionOverride: TrajectoryQuaternion | null;
+  lookAtTarget: TrajectoryPoint | null;
   segmentIndex: number;
   pointIndex: number;
 };
@@ -91,6 +102,10 @@ function trajectoryPathEntries(
   const entries: TrajectoryPathEntry[] = [];
   segments.forEach((segment, segmentIndex) => {
     segment.points.forEach((point, pointIndex) => {
+      const lookAtTarget =
+        pointIndex < segment.points.length - 1
+          ? (segment.look_at_target ?? null)
+          : null;
       const quaternion = segment.quaternions?.[pointIndex] ?? null;
       const directionOverride =
         segment.direction_overrides?.[pointIndex] ?? null;
@@ -100,12 +115,14 @@ function trajectoryPathEntries(
           previous.quaternion = quaternion;
         if (!previous.directionOverride && directionOverride)
           previous.directionOverride = directionOverride;
+        previous.lookAtTarget = lookAtTarget;
         return;
       }
       entries.push({
         point,
         quaternion,
         directionOverride,
+        lookAtTarget,
         segmentIndex,
         pointIndex,
       });
@@ -976,6 +993,7 @@ export function cameraViewsFromSegments(
     quaternion: entries[index]!.quaternion ?? reference.quaternion,
     angleKey: Boolean(entries[index]!.quaternion),
     directionOverride: entries[index]!.directionOverride ?? undefined,
+    lookAtTarget: entries[index]!.lookAtTarget ?? undefined,
   }));
 }
 
@@ -1149,7 +1167,7 @@ export function sampleCameraPath(
             manualQuaternion,
             presetOrientationFrame!,
           );
-    const quaternion = presetQuaternion
+    const baseQuaternion = presetQuaternion
       ? presetDeltaAtProgress(
           presetOverrideDeltas,
           curveProgress,
@@ -1157,6 +1175,15 @@ export function sampleCameraPath(
           closed,
         ).multiply(presetQuaternion)
       : manualQuaternion;
+    const quaternion =
+      partialLookAtQuaternion(
+        pathViews,
+        segment,
+        amount,
+        position,
+        baseQuaternion,
+        closed,
+      ) ?? baseQuaternion;
     if (previousQuaternion && previousQuaternion.dot(quaternion) < 0) {
       quaternion.set(
         -quaternion.x,
@@ -1183,16 +1210,129 @@ export function sampleCameraPath(
   });
 }
 
+const PART_DIRECTION_HANDOFF = 0.25;
+
+function partialLookAtQuaternion(
+  views: readonly CameraView[],
+  spanIndex: number,
+  amount: number,
+  position: THREE.Vector3,
+  baseQuaternion: THREE.Quaternion,
+  closed: boolean,
+): THREE.Quaternion | null {
+  const currentTarget = lookAtTargetForSpan(views, spanIndex, closed);
+  const previousTarget = lookAtTargetForSpan(views, spanIndex - 1, closed);
+  const nextTarget = lookAtTargetForSpan(views, spanIndex + 1, closed);
+
+  if (currentTarget) {
+    const current = quaternionLookingAtPoint(
+      position,
+      currentTarget,
+      baseQuaternion,
+    );
+    if (
+      previousTarget &&
+      !sameTrajectoryPoint(previousTarget, currentTarget) &&
+      amount < PART_DIRECTION_HANDOFF
+    ) {
+      const previous = quaternionLookingAtPoint(
+        position,
+        previousTarget,
+        baseQuaternion,
+      );
+      const boundary = previous.clone().slerp(current, 0.5);
+      return boundary.slerp(
+        current,
+        smoothstep(amount / PART_DIRECTION_HANDOFF),
+      );
+    }
+    if (
+      nextTarget &&
+      !sameTrajectoryPoint(nextTarget, currentTarget) &&
+      amount > 1 - PART_DIRECTION_HANDOFF
+    ) {
+      const next = quaternionLookingAtPoint(
+        position,
+        nextTarget,
+        baseQuaternion,
+      );
+      const boundary = current.clone().slerp(next, 0.5);
+      return current.slerp(
+        boundary,
+        smoothstep(
+          (amount - (1 - PART_DIRECTION_HANDOFF)) / PART_DIRECTION_HANDOFF,
+        ),
+      );
+    }
+    return current;
+  }
+
+  if (previousTarget && amount < PART_DIRECTION_HANDOFF) {
+    const previous = quaternionLookingAtPoint(
+      position,
+      previousTarget,
+      baseQuaternion,
+    );
+    return previous.slerp(
+      baseQuaternion,
+      smoothstep(amount / PART_DIRECTION_HANDOFF),
+    );
+  }
+  if (nextTarget && amount > 1 - PART_DIRECTION_HANDOFF) {
+    const next = quaternionLookingAtPoint(position, nextTarget, baseQuaternion);
+    return baseQuaternion
+      .clone()
+      .slerp(
+        next,
+        smoothstep(
+          (amount - (1 - PART_DIRECTION_HANDOFF)) / PART_DIRECTION_HANDOFF,
+        ),
+      );
+  }
+  return null;
+}
+
+function lookAtTargetForSpan(
+  views: readonly CameraView[],
+  spanIndex: number,
+  closed: boolean,
+): TrajectoryPoint | null {
+  const spanCount = closed ? views.length : views.length - 1;
+  if (spanCount <= 0) return null;
+  if (!closed && (spanIndex < 0 || spanIndex >= spanCount)) return null;
+  const normalizedIndex = THREE.MathUtils.euclideanModulo(spanIndex, spanCount);
+  return views[normalizedIndex]?.lookAtTarget ?? null;
+}
+
+function quaternionLookingAtPoint(
+  position: THREE.Vector3,
+  target: TrajectoryPoint,
+  fallback: THREE.Quaternion,
+): THREE.Quaternion {
+  const direction = new THREE.Vector3(...target).sub(position);
+  return direction.lengthSq() > 1e-10
+    ? cameraQuaternionFacingDirection(direction, new THREE.Quaternion())
+    : fallback.clone();
+}
+
+function smoothstep(amount: number): number {
+  const clamped = THREE.MathUtils.clamp(amount, 0, 1);
+  return clamped * clamped * (3 - 2 * clamped);
+}
+
 export function cameraTargetIsClearOfPath(
   views: readonly CameraView[],
   target: TrajectoryPoint,
   closedLoop: boolean,
   clearance: number,
+  spanIndexes?: readonly number[],
 ): boolean {
   if (views.length < 2) return true;
   const path = normalizedCameraPath(views, closedLoop);
   const curve = cameraPathCurve(path.views, path.closed);
   const subdivisionCount = Math.max(256, path.views.length * 64);
+  const segmentCount = path.closed ? path.views.length : path.views.length - 1;
+  const includedSpans = spanIndexes ? new Set(spanIndexes) : null;
   const targetVector = new THREE.Vector3(...target);
   const closest = new THREE.Vector3();
   let previous = cameraPositionAtProgress(
@@ -1213,6 +1353,14 @@ export function cameraTargetIsClearOfPath(
       false,
       index === subdivisionCount,
     );
+    const spanIndex = Math.min(
+      Math.floor(((index - 0.5) / subdivisionCount) * segmentCount),
+      segmentCount - 1,
+    );
+    if (includedSpans && !includedSpans.has(spanIndex)) {
+      previous = current;
+      continue;
+    }
     new THREE.Line3(previous, current).closestPointToPoint(
       targetVector,
       true,
@@ -1222,6 +1370,47 @@ export function cameraTargetIsClearOfPath(
     previous = current;
   }
   return true;
+}
+
+export function partLookAtTargetIsClearOfPath(
+  views: readonly CameraView[],
+  target: TrajectoryPoint,
+  closedLoop: boolean,
+  clearance: number,
+): boolean {
+  if (views.length < 2) return true;
+  const path = normalizedCameraPath(views, closedLoop);
+  const spanCount = path.closed ? path.views.length : path.views.length - 1;
+  const targetSpans = Array.from({ length: spanCount }, (_, spanIndex) =>
+    sameOptionalTrajectoryPoint(
+      lookAtTargetForSpan(path.views, spanIndex, path.closed),
+      target,
+    ) ||
+    sameOptionalTrajectoryPoint(
+      lookAtTargetForSpan(path.views, spanIndex - 1, path.closed),
+      target,
+    ) ||
+    sameOptionalTrajectoryPoint(
+      lookAtTargetForSpan(path.views, spanIndex + 1, path.closed),
+      target,
+    )
+      ? spanIndex
+      : null,
+  ).filter((spanIndex): spanIndex is number => spanIndex !== null);
+  return cameraTargetIsClearOfPath(
+    views,
+    target,
+    closedLoop,
+    clearance,
+    targetSpans,
+  );
+}
+
+function sameOptionalTrajectoryPoint(
+  first: TrajectoryPoint | null,
+  second: TrajectoryPoint,
+): boolean {
+  return first !== null && sameTrajectoryPoint(first, second);
 }
 
 export function sampleCameraPivot(
