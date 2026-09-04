@@ -1125,6 +1125,50 @@ describe("3D drawn camera paths", () => {
     expect(Math.max(...radii) - Math.min(...radii)).toBeLessThan(1e-6);
   });
 
+  it("keeps a closed underwater shape below the floor when allowed", () => {
+    const parts: TrajectorySegment[] = [
+      {
+        id: "underwater",
+        points: [
+          [3, -3, 0],
+          [0, -3, 3],
+          [-3, -3, 0],
+          [0, -3, -3],
+        ],
+      },
+    ];
+    const overheadView = cameraDrawingView(
+      new THREE.Quaternion()
+        .setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2)
+        .toArray(),
+    );
+
+    const locked = reshapeTrajectorySegments(
+      parts,
+      "circular",
+      overheadView,
+      null,
+      true,
+    )!;
+    const underwater = reshapeTrajectorySegments(
+      parts,
+      "circular",
+      overheadView,
+      null,
+      true,
+      true,
+    )!;
+
+    expect(
+      Math.min(...trajectoryPathFromSegments(locked).map((point) => point[1])),
+    ).toBeGreaterThanOrEqual(0);
+    expect(
+      Math.max(
+        ...trajectoryPathFromSegments(underwater).map((point) => point[1]),
+      ),
+    ).toBeLessThan(0);
+  });
+
   it("flattens a selected part onto the current view plane", () => {
     const parts: TrajectorySegment[] = [
       {
@@ -1384,6 +1428,30 @@ describe("3D drawn camera paths", () => {
       pivotNumber: 2,
     });
     expect(inserted?.segments[0]?.points[1]).toEqual([0.8, 2, 0]);
+  });
+
+  it("adds an underwater pivot only when below-floor editing is allowed", () => {
+    const parts: TrajectorySegment[] = [
+      {
+        id: "one",
+        points: [
+          [0, 1, 0],
+          [2, 1, 0],
+        ],
+      },
+    ];
+
+    const locked = insertTrajectoryPivot(parts, [1, -2, 0], 0.5)!;
+    const underwater = insertTrajectoryPivot(
+      parts,
+      [1, -2, 0],
+      0.5,
+      false,
+      true,
+    )!;
+
+    expect(locked.segments[0]?.points[1]?.[1]).toBe(0);
+    expect(underwater.segments[0]?.points[1]?.[1]).toBe(-2);
   });
 
   it("does not add more than the manual pivot limit", () => {
@@ -1763,6 +1831,9 @@ describe("3D drawn camera paths", () => {
     expect(Math.max(turnedBoundary[0][1], turnedBoundary[1][1])).toBeCloseTo(
       0.94,
     );
+    expect(
+      frameTrajectorySpaceAboveFloor(SPACE, FRONT_VIEW, START.position, true),
+    ).toBe(SPACE);
   });
 
   it("recenters a far path endpoint before framing the floor", () => {
@@ -1929,6 +2000,43 @@ describe("3D drawn camera paths", () => {
       101,
     );
     expect(samples.every((sample) => sample.position[1] >= 0)).toBe(true);
+  });
+
+  it("preserves an underwater stroke through preview and generation", () => {
+    const path = appendDrawnTrajectory(
+      [],
+      [
+        [0.5, 0.4],
+        [0.5, 0.8],
+      ],
+      FRONT_VIEW,
+      SPACE,
+      START.position,
+      true,
+    );
+    const views = cameraViewsFromTrajectory(path, START, true);
+    const samples = sampleCameraPath(views, 9, { allowBelowFloor: true });
+    const cameras = buildTargetCameras(views, 9, 1280, 720, {
+      allowBelowFloor: true,
+    });
+
+    expect(path.at(-1)?.[1]).toBeLessThan(0);
+    expect(samples.at(-1)?.position[1]).toBe(path.at(-1)?.[1]);
+    expect(cameras.at(-1)?.extrinsics.position[1]).toBe(path.at(-1)?.[1]);
+    expect(cameraViewsFromTrajectory(path, START).at(-1)?.position[1]).toBe(0);
+  });
+
+  it("checks look targets against the underwater path", () => {
+    const views = [
+      { ...START, position: [-1, -2, 0] as [number, number, number] },
+      { ...END, position: [1, -2, 0] as [number, number, number] },
+    ];
+    const target: [number, number, number] = [0, -2, 0];
+
+    expect(cameraTargetIsClearOfPath(views, target, false, 0.05)).toBe(true);
+    expect(
+      cameraTargetIsClearOfPath(views, target, false, 0.05, undefined, true),
+    ).toBe(false);
   });
 
   it("keeps the reference angle until manual pivot angles are set", () => {

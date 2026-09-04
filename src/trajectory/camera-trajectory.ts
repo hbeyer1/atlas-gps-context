@@ -19,6 +19,7 @@ export type CameraPathOptions = {
   directionMode?: CameraDirectionMode;
   directionTarget?: TrajectoryPoint;
   closedLoop?: boolean;
+  allowBelowFloor?: boolean;
 };
 export type SampledCameraView = Omit<
   CameraView,
@@ -158,6 +159,7 @@ export function reshapeTrajectorySegments(
   view: TrajectoryDrawingView,
   segmentId: string | null,
   closedLoop: boolean,
+  allowBelowFloor = false,
 ): TrajectorySegment[] | null {
   const selectedIndex = segmentId
     ? segments.findIndex((segment) => segment.id === segmentId)
@@ -197,11 +199,13 @@ export function reshapeTrajectorySegments(
             shapeSourcePoints,
             view,
             !segmentId && closedLoop,
+            allowBelowFloor,
           )
         : flattenTrajectoryPoints(
             shapeSourcePoints,
             view,
             !segmentId && closedLoop,
+            allowBelowFloor,
           );
   const shapedPoints = repeatedClosedEndpoint
     ? [...shapedLogicalPoints, shapedLogicalPoints[0]!]
@@ -210,7 +214,7 @@ export function reshapeTrajectorySegments(
     shapedPoints.some(
       (point) =>
         point.some((coordinate) => !Number.isFinite(coordinate)) ||
-        point[1] < TRAJECTORY_FLOOR_Y - 1e-6,
+        (!allowBelowFloor && point[1] < TRAJECTORY_FLOOR_Y - 1e-6),
     ) ||
     shapedPoints.some(
       (point, index) =>
@@ -245,8 +249,11 @@ function circularTrajectoryPoints(
   points: readonly TrajectoryPoint[],
   view: TrajectoryDrawingView,
   closed: boolean,
+  allowBelowFloor: boolean,
 ): TrajectoryPoint[] {
-  if (closed) return circularLoopTrajectoryPoints(points, view);
+  if (closed) {
+    return circularLoopTrajectoryPoints(points, view, allowBelowFloor);
+  }
 
   const start = new THREE.Vector3(...points[0]!);
   const end = new THREE.Vector3(...points.at(-1)!);
@@ -316,6 +323,7 @@ function circularTrajectoryPoints(
 function circularLoopTrajectoryPoints(
   points: readonly TrajectoryPoint[],
   view: TrajectoryDrawingView,
+  allowBelowFloor: boolean,
 ): TrajectoryPoint[] {
   const normal = new THREE.Vector3(...view.forward).normalize();
   const center = points
@@ -354,10 +362,12 @@ function circularLoopTrajectoryPoints(
       .addScaledVector(right, Math.cos(angle) * radius)
       .addScaledVector(up, Math.sin(angle) * radius);
   });
-  const floorShift = Math.max(
-    0,
-    TRAJECTORY_FLOOR_Y - Math.min(...shaped.map((point) => point.y)),
-  );
+  const floorShift = allowBelowFloor
+    ? 0
+    : Math.max(
+        0,
+        TRAJECTORY_FLOOR_Y - Math.min(...shaped.map((point) => point.y)),
+      );
   return shaped.map((point) => {
     point.y += floorShift;
     return point.toArray();
@@ -368,6 +378,7 @@ function flattenTrajectoryPoints(
   points: readonly TrajectoryPoint[],
   view: TrajectoryDrawingView,
   closed: boolean,
+  allowBelowFloor: boolean,
 ): TrajectoryPoint[] {
   const start = new THREE.Vector3(...points[0]!);
   const end = new THREE.Vector3(...points.at(-1)!);
@@ -393,10 +404,12 @@ function flattenTrajectoryPoints(
     return projected;
   });
   if (closed) {
-    const floorShift = Math.max(
-      0,
-      TRAJECTORY_FLOOR_Y - Math.min(...shaped.map((point) => point.y)),
-    );
+    const floorShift = allowBelowFloor
+      ? 0
+      : Math.max(
+          0,
+          TRAJECTORY_FLOOR_Y - Math.min(...shaped.map((point) => point.y)),
+        );
     return shaped.map((point) => {
       point.y += floorShift;
       return point.toArray();
@@ -656,6 +669,7 @@ export function insertTrajectoryPivot(
   position: TrajectoryPoint,
   curveProgress: number,
   closedLoop = false,
+  allowBelowFloor = false,
 ): {
   segments: TrajectorySegment[];
   segmentId: string;
@@ -682,7 +696,7 @@ export function insertTrajectoryPivot(
   if (segment.points.length >= MAX_PIVOTS_PER_PART) return null;
   const nextPosition: TrajectoryPoint = [
     position[0],
-    Math.max(TRAJECTORY_FLOOR_Y, position[1]),
+    allowBelowFloor ? position[1] : Math.max(TRAJECTORY_FLOOR_Y, position[1]),
     position[2],
   ];
   const pointIndex = owner.pointIndex + (closingSpan ? 1 : 0);
@@ -806,12 +820,14 @@ export function frameTrajectorySpaceAboveFloor(
   space: TrajectorySpace,
   view: TrajectoryDrawingView,
   anchor: TrajectoryPoint,
+  allowBelowFloor = false,
 ): TrajectorySpace {
   const [anchorX, anchorY] = projectTrajectoryPoint(anchor, view, space);
   const anchoredSpace =
     anchorX >= 0 && anchorX <= 1 && anchorY >= 0 && anchorY <= 1
       ? space
       : { ...space, center: [...anchor] as TrajectoryPoint };
+  if (allowBelowFloor) return anchoredSpace;
   const boundary = trajectoryFloorBoundary(view, anchoredSpace, anchor);
   if (!boundary) return anchoredSpace;
 
@@ -857,6 +873,7 @@ export function unprojectTrajectoryPoint(
   view: TrajectoryDrawingView,
   space: TrajectorySpace,
   anchor: TrajectoryPoint,
+  allowBelowFloor = false,
 ): TrajectoryPoint {
   const right = new THREE.Vector3(...view.right);
   const up = new THREE.Vector3(...view.up);
@@ -868,7 +885,9 @@ export function unprojectTrajectoryPoint(
     .addScaledVector(right, (point[0] - 0.5) * space.radius * 2)
     .addScaledVector(up, (0.5 - point[1]) * space.radius * 2)
     .addScaledVector(forward, anchorOffset.dot(forward));
-  position.y = Math.max(TRAJECTORY_FLOOR_Y, position.y);
+  if (!allowBelowFloor) {
+    position.y = Math.max(TRAJECTORY_FLOOR_Y, position.y);
+  }
   return position.toArray();
 }
 
@@ -901,12 +920,15 @@ export function appendDrawnTrajectory(
   view: TrajectoryDrawingView,
   space: TrajectorySpace,
   referencePosition: TrajectoryPoint,
+  allowBelowFloor = false,
 ): TrajectoryPoint[] {
   if (stroke.length < 2) return [...existing];
   const anchor = existing.at(-1) ?? referencePosition;
   const newPoints = resampleDrawStroke(stroke)
     .slice(existing.length > 0 ? 1 : 0)
-    .map((point) => unprojectTrajectoryPoint(point, view, space, anchor));
+    .map((point) =>
+      unprojectTrajectoryPoint(point, view, space, anchor, allowBelowFloor),
+    );
   const path = [...existing];
   for (const point of newPoints) {
     const previous = path.at(-1);
@@ -962,13 +984,14 @@ function resampleDrawStroke(stroke: readonly DrawPoint[]): DrawPoint[] {
 export function cameraViewsFromTrajectory(
   path: readonly TrajectoryPoint[],
   reference: CameraView,
+  allowBelowFloor = false,
 ): CameraView[] {
   if (path.length < 2) return [];
 
   return path.map((point, index) => {
     const position: TrajectoryPoint = [
       point[0],
-      Math.max(TRAJECTORY_FLOOR_Y, point[1]),
+      allowBelowFloor ? point[1] : Math.max(TRAJECTORY_FLOOR_Y, point[1]),
       point[2],
     ];
     return {
@@ -983,11 +1006,13 @@ export function cameraViewsFromTrajectory(
 export function cameraViewsFromSegments(
   segments: readonly TrajectorySegment[],
   reference: CameraView,
+  allowBelowFloor = false,
 ): CameraView[] {
   const entries = trajectoryPathEntries(segments);
   return cameraViewsFromTrajectory(
     entries.map((entry) => entry.point),
     reference,
+    allowBelowFloor,
   ).map((view, index) => ({
     ...view,
     quaternion: entries[index]!.quaternion ?? reference.quaternion,
@@ -1086,11 +1111,13 @@ export function sampleCameraPath(
     directionMode = "manual",
     directionTarget,
     closedLoop = false,
+    allowBelowFloor = false,
   } = options;
+  const minimumY = allowBelowFloor ? -Infinity : TRAJECTORY_FLOOR_Y;
   const path = normalizedCameraPath(views, closedLoop);
   const pathViews = path.views;
   const closed = path.closed;
-  const curve = cameraPathCurve(pathViews, closed);
+  const curve = cameraPathCurve(pathViews, closed, minimumY);
   const orientationKeys = cameraOrientationKeys(pathViews, closed);
   const segmentCount = closed ? pathViews.length : pathViews.length - 1;
   const constantFovRadians = pathViews.every(
@@ -1109,6 +1136,7 @@ export function sampleCameraPath(
       closed,
       index === 0,
       index === frameCount - 1,
+      minimumY,
     ),
   );
   const target =
@@ -1116,7 +1144,7 @@ export function sampleCameraPath(
     directionMode === "outward" ||
     directionMode === "look_at" ||
     directionMode === "look_away"
-      ? cameraDirectionTarget(pathViews, directionTarget)
+      ? cameraDirectionTarget(pathViews, directionTarget, minimumY)
       : null;
   const presetOrientationFrame =
     directionMode === "manual"
@@ -1128,6 +1156,7 @@ export function sampleCameraPath(
           target,
           closed,
           orientationKeys,
+          minimumY,
         );
   const presetOverrideDeltas =
     directionMode === "manual" ||
@@ -1142,6 +1171,7 @@ export function sampleCameraPath(
           closed,
           orientationKeys,
           presetOrientationFrame!,
+          minimumY,
         );
   let previousQuaternion: THREE.Quaternion | null = null;
 
@@ -1166,6 +1196,7 @@ export function sampleCameraPath(
             closed,
             manualQuaternion,
             presetOrientationFrame!,
+            minimumY,
           );
     const baseQuaternion = presetQuaternion
       ? presetDeltaAtProgress(
@@ -1326,10 +1357,12 @@ export function cameraTargetIsClearOfPath(
   closedLoop: boolean,
   clearance: number,
   spanIndexes?: readonly number[],
+  allowBelowFloor = false,
 ): boolean {
   if (views.length < 2) return true;
+  const minimumY = allowBelowFloor ? -Infinity : TRAJECTORY_FLOOR_Y;
   const path = normalizedCameraPath(views, closedLoop);
-  const curve = cameraPathCurve(path.views, path.closed);
+  const curve = cameraPathCurve(path.views, path.closed, minimumY);
   const subdivisionCount = Math.max(256, path.views.length * 64);
   const segmentCount = path.closed ? path.views.length : path.views.length - 1;
   const includedSpans = spanIndexes ? new Set(spanIndexes) : null;
@@ -1342,6 +1375,7 @@ export function cameraTargetIsClearOfPath(
     path.closed,
     true,
     false,
+    minimumY,
   );
   for (let index = 1; index <= subdivisionCount; index += 1) {
     const progress = index / subdivisionCount;
@@ -1352,6 +1386,7 @@ export function cameraTargetIsClearOfPath(
       path.closed,
       false,
       index === subdivisionCount,
+      minimumY,
     );
     const spanIndex = Math.min(
       Math.floor(((index - 0.5) / subdivisionCount) * segmentCount),
@@ -1377,6 +1412,7 @@ export function partLookAtTargetIsClearOfPath(
   target: TrajectoryPoint,
   closedLoop: boolean,
   clearance: number,
+  allowBelowFloor = false,
 ): boolean {
   if (views.length < 2) return true;
   const path = normalizedCameraPath(views, closedLoop);
@@ -1403,6 +1439,7 @@ export function partLookAtTargetIsClearOfPath(
     closedLoop,
     clearance,
     targetSpans,
+    allowBelowFloor,
   );
 }
 
@@ -1426,8 +1463,9 @@ export function sampleCameraPivot(
     };
   }
   if (views.length === 1) {
+    const minimumY = options.allowBelowFloor ? -Infinity : TRAJECTORY_FLOOR_Y;
     return {
-      position: floorSafePosition(views[0]!.position),
+      position: constrainPosition(views[0]!.position, minimumY),
       quaternion: views[0]!.quaternion,
       fovRadians: views[0]!.fovRadians,
     };
@@ -1682,10 +1720,15 @@ function cubicHermiteAtProgress(
 function smoothCurvePoint(
   curve: THREE.CatmullRomCurve3,
   progress: number,
-  periodic = false,
+  periodic: boolean,
+  minimumY: number,
 ): THREE.Vector3 {
   if (!periodic && (progress <= 0 || progress >= 1)) {
-    return floorSafeCurvePoint(curve, THREE.MathUtils.clamp(progress, 0, 1));
+    return constrainCurvePoint(
+      curve,
+      THREE.MathUtils.clamp(progress, 0, 1),
+      minimumY,
+    );
   }
 
   const point = new THREE.Vector3();
@@ -1693,54 +1736,59 @@ function smoothCurvePoint(
     const offset = index - Math.floor(POSITION_SMOOTHING_WEIGHTS.length / 2);
     point.addScaledVector(
       periodic
-        ? floorSafeCurvePoint(
+        ? constrainCurvePoint(
             curve,
             THREE.MathUtils.euclideanModulo(
               progress + offset * POSITION_SMOOTHING_STEP,
               1,
             ),
+            minimumY,
           )
         : extendedCurvePoint(
             curve,
             progress + offset * POSITION_SMOOTHING_STEP,
+            minimumY,
           ),
       weight / POSITION_SMOOTHING_WEIGHT_TOTAL,
     );
   });
-  point.y = Math.max(TRAJECTORY_FLOOR_Y, point.y);
+  point.y = Math.max(minimumY, point.y);
   return point;
 }
 
 function extendedCurvePoint(
   curve: THREE.CatmullRomCurve3,
   progress: number,
+  minimumY: number,
 ): THREE.Vector3 {
   if (progress < 0) {
-    return floorSafeCurvePoint(curve, 0)
+    return constrainCurvePoint(curve, 0, minimumY)
       .multiplyScalar(2)
-      .sub(floorSafeCurvePoint(curve, -progress));
+      .sub(constrainCurvePoint(curve, -progress, minimumY));
   }
   if (progress > 1) {
-    return floorSafeCurvePoint(curve, 1)
+    return constrainCurvePoint(curve, 1, minimumY)
       .multiplyScalar(2)
-      .sub(floorSafeCurvePoint(curve, 2 - progress));
+      .sub(constrainCurvePoint(curve, 2 - progress, minimumY));
   }
-  return floorSafeCurvePoint(curve, progress);
+  return constrainCurvePoint(curve, progress, minimumY);
 }
 
-function floorSafeCurvePoint(
+function constrainCurvePoint(
   curve: THREE.CatmullRomCurve3,
   progress: number,
+  minimumY: number,
 ): THREE.Vector3 {
   const point = curve.getPoint(progress);
-  point.y = Math.max(TRAJECTORY_FLOOR_Y, point.y);
+  point.y = Math.max(minimumY, point.y);
   return point;
 }
 
-function floorSafePosition(
+function constrainPosition(
   position: readonly [number, number, number],
+  minimumY: number,
 ): TrajectoryPoint {
-  return [position[0], Math.max(TRAJECTORY_FLOOR_Y, position[1]), position[2]];
+  return [position[0], Math.max(minimumY, position[1]), position[2]];
 }
 
 function cameraPositionAtProgress(
@@ -1750,14 +1798,19 @@ function cameraPositionAtProgress(
   closed: boolean,
   firstFrame: boolean,
   lastFrame: boolean,
+  minimumY: number,
 ): THREE.Vector3 {
   if (!closed && firstFrame) {
-    return new THREE.Vector3(...floorSafePosition(views[0]!.position));
+    return new THREE.Vector3(
+      ...constrainPosition(views[0]!.position, minimumY),
+    );
   }
   if (!closed && lastFrame) {
-    return new THREE.Vector3(...floorSafePosition(views.at(-1)!.position));
+    return new THREE.Vector3(
+      ...constrainPosition(views.at(-1)!.position, minimumY),
+    );
   }
-  return smoothCurvePoint(curve, progress, closed);
+  return smoothCurvePoint(curve, progress, closed, minimumY);
 }
 
 type CameraPresetOrientationFrame = {
@@ -1774,6 +1827,7 @@ function cameraPresetQuaternion(
   closed: boolean,
   fallback: THREE.Quaternion,
   frame: CameraPresetOrientationFrame,
+  minimumY: number,
 ): THREE.Quaternion {
   const direction = cameraPresetDirection(
     curve,
@@ -1783,6 +1837,7 @@ function cameraPresetQuaternion(
     target,
     closed,
     fallback,
+    minimumY,
   );
   if (directionMode === "look_at" || directionMode === "look_away") {
     // A fixed pole fallback keeps ignored per-camera angles from adding roll.
@@ -1802,6 +1857,7 @@ function cameraPresetOverrideDeltas(
   closed: boolean,
   orientationKeys: CameraOrientationKeys,
   frame: CameraPresetOrientationFrame,
+  minimumY: number,
 ): THREE.Quaternion[] | null {
   if (!views.some((view) => view.directionOverride)) return null;
 
@@ -1815,6 +1871,7 @@ function cameraPresetOverrideDeltas(
       closed,
       index === 0,
       index === views.length - 1,
+      minimumY,
     );
     const fallback = quaternionAtProgress(orientationKeys, progress);
     const base = cameraPresetQuaternion(
@@ -1826,6 +1883,7 @@ function cameraPresetOverrideDeltas(
       closed,
       fallback,
       frame,
+      minimumY,
     );
     return new THREE.Quaternion(...view.directionOverride)
       .normalize()
@@ -1840,6 +1898,7 @@ function cameraPresetOrientationFrame(
   target: THREE.Vector3 | null,
   closed: boolean,
   orientationKeys: CameraOrientationKeys,
+  minimumY: number,
 ): CameraPresetOrientationFrame {
   const pivotProgresses = views.map((_, index) =>
     closed ? index / views.length : index / (views.length - 1),
@@ -1864,6 +1923,7 @@ function cameraPresetOrientationFrame(
       closed,
       progress === 0,
       progress === 1,
+      minimumY,
     );
     return cameraPresetDirection(
       curve,
@@ -1873,6 +1933,7 @@ function cameraPresetOrientationFrame(
       target,
       closed,
       quaternionAtProgress(orientationKeys, progress),
+      minimumY,
     );
   });
   const quaternions = transportedCameraQuaternions(
@@ -1892,10 +1953,11 @@ function cameraPresetDirection(
   target: THREE.Vector3 | null,
   closed: boolean,
   fallback: THREE.Quaternion,
+  minimumY: number,
 ): THREE.Vector3 {
   const direction =
     directionMode === "forward"
-      ? smoothCurveDirection(curve, progress, closed)
+      ? smoothCurveDirection(curve, progress, closed, minimumY)
       : target
         ? radialCameraDirection(position, target, directionMode)
         : new THREE.Vector3();
@@ -1999,12 +2061,13 @@ function presetDeltaAtProgress(
 function cameraDirectionTarget(
   views: readonly CameraView[],
   directionTarget?: TrajectoryPoint,
+  minimumY = TRAJECTORY_FLOOR_Y,
 ): THREE.Vector3 {
   if (directionTarget) return new THREE.Vector3(...directionTarget);
 
   const target = views.reduce(
     (sum, view) =>
-      sum.add(new THREE.Vector3(...floorSafePosition(view.position))),
+      sum.add(new THREE.Vector3(...constrainPosition(view.position, minimumY))),
     new THREE.Vector3(),
   );
   return target.multiplyScalar(1 / views.length);
@@ -2038,9 +2101,13 @@ function normalizedCameraPath(
 function cameraPathCurve(
   views: readonly CameraView[],
   closed: boolean,
+  minimumY: number,
 ): THREE.CatmullRomCurve3 {
   return new THREE.CatmullRomCurve3(
-    views.map((view) => new THREE.Vector3(...floorSafePosition(view.position))),
+    views.map(
+      (view) =>
+        new THREE.Vector3(...constrainPosition(view.position, minimumY)),
+    ),
     closed,
     "centripetal",
   );
@@ -2050,6 +2117,7 @@ function smoothCurveDirection(
   curve: THREE.CatmullRomCurve3,
   progress: number,
   periodic: boolean,
+  minimumY: number,
 ): THREE.Vector3 {
   const start = periodic
     ? progress - POSITION_SMOOTHING_STEP
@@ -2057,8 +2125,8 @@ function smoothCurveDirection(
   const end = periodic
     ? progress + POSITION_SMOOTHING_STEP
     : Math.min(1, progress + POSITION_SMOOTHING_STEP);
-  const direction = smoothCurvePoint(curve, end, periodic).sub(
-    smoothCurvePoint(curve, start, periodic),
+  const direction = smoothCurvePoint(curve, end, periodic, minimumY).sub(
+    smoothCurvePoint(curve, start, periodic, minimumY),
   );
   return direction.lengthSq() > 1e-10
     ? direction
