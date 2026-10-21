@@ -1,459 +1,426 @@
-import { EXAMPLE_ID } from "../src/example.ts";
-import "dotenv/config";
+// Atlas map studio's local server. It serves the editor, keeps each project as a plain folder on disk (laid out like
+// ../october, so the October tools work on it), and runs the Python pipeline for everything that touches World Labs
+// or the map data. It never sees a World Labs key: the Python tools use the CLI login (october/tools/wl.py).
 import express from "express";
-import { clerkMiddleware, clerkClient, getAuth } from "@clerk/express";
-import Stripe from "stripe";
-import { createHmac } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { resolve } from "node:path";
-import { z } from "zod";
-import { Ledger, LedgerError } from "./ledger.ts";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
-  FRAMES,
-  FPS,
-  PACK_CREDITS,
-  CREDIT_PACKS,
-  checkoutPack,
-  PACK_CENTS,
-  poseSchema,
-  generateSchema,
-  type TaskResult,
-} from "./contracts.ts";
-import { readAsset } from "./marble.ts";
-import { JobRunner } from "./jobs.ts";
-import { fulfillCheckout } from "./payments.ts";
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, extname, join, resolve } from "node:path";
 
-const mode = process.env.APP_MODE || "local";
-if (!["local", "hosted"].includes(mode))
-  throw new Error("APP_MODE must be local or hosted");
-const hosted = mode === "hosted";
-const origin =
-  process.env.APP_ORIGIN || (hosted ? "" : "http://127.0.0.1:3030");
-if (hosted) {
-  for (const key of [
-    "APP_ORIGIN",
-    "CLERK_PUBLISHABLE_KEY",
-    "CLERK_SECRET_KEY",
-    "PHONE_HASH_SECRET",
-    "WLT_API_KEY",
-    "STRIPE_SECRET_KEY",
-    "STRIPE_WEBHOOK_SECRET",
-    "STRIPE_PRICE_ID",
-  ]) {
-    if (!process.env[key]) throw new Error("Hosted mode requires " + key);
-  }
-  const url = new URL(origin);
-  const localTest =
-    url.protocol === "http:" &&
-    ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) &&
-    process.env.CLERK_SECRET_KEY!.startsWith("sk_test_") &&
-    /^(sk|rk)_test_/.test(process.env.STRIPE_SECRET_KEY!);
-  if (
-    (url.protocol !== "https:" && !localTest) ||
-    process.env.PHONE_HASH_SECRET!.length < 32
-  )
-    throw new Error(
-      "Hosted mode requires HTTPS and a strong phone hash secret",
+const PORT = Number(process.env.PORT || 8790);
+const STUDIO = resolve(import.meta.dirname, "..");
+const MEMORY_WORLDS = resolve(STUDIO, "..");
+const OCTOBER = join(MEMORY_WORLDS, "october");
+const PYTHON = join(MEMORY_WORLDS, ".venv", "bin", "python");
+const PROJECTS = resolve(process.env.PROJECTS_DIR || join(STUDIO, "projects"));
+const CREDITS_PER_VIEW = 50;
+mkdirSync(PROJECTS, { recursive: true });
+
+// ---------------------------------------------------------------- Python
+type Job = {
+  id: string;
+  project: string;
+  label: string;
+  status: "running" | "done" | "failed";
+  log: string;
+  result?: unknown;
+};
+const jobs = new Map<string, Job>();
+const tool = (name: string) => join(OCTOBER, "tools", name);
+const studioTool = join(STUDIO, "tools", "studio.py");
+
+// One Python command, run the way the October pipeline is run: from the october folder, with the shared env.
+function runPython(project: string, args: string[], log: (s: string) => void) {
+  return new Promise<string>((done, fail) => {
+    const child = spawn(PYTHON, ["-I", ...args], {
+      cwd: OCTOBER,
+      env: {
+        ...process.env,
+        PLACE_ROOT: projectDir(project),
+        OPENCV_IO_ENABLE_OPENEXR: "1",
+      },
+    });
+    let out = "";
+    child.stdout.on("data", (d) => {
+      out += d;
+      log(String(d));
+    });
+    child.stderr.on("data", (d) => log(String(d)));
+    child.on("error", fail);
+    child.on("close", (code) =>
+      code === 0
+        ? done(out)
+        : fail(new Error(`${args[0].split("/").pop()} exited with ${code}`)),
     );
+  });
 }
-const loopbackOrigin = ["localhost", "127.0.0.1", "[::1]"].includes(
-  new URL(origin).hostname,
-);
-const data = resolve(process.env.DATA_DIR || "data");
-mkdirSync(data, { recursive: true, mode: 0o700 });
-const ledger = new Ledger(resolve(data, "studio.sqlite"), {
-  dailyLimit: hosted ? 10 : 100,
-  globalDailyLimit: hosted ? 300 : 1000,
+
+// The last line a studio.py command prints is its JSON result.
+const lastJson = (out: string) => JSON.parse(out.trim().split("\n").at(-1)!);
+
+// Long steps run as jobs the editor polls.
+function startJob(project: string, label: string, steps: string[][]) {
+  const job: Job = {
+    id: randomUUID(),
+    project,
+    label,
+    status: "running",
+    log: "",
+  };
+  jobs.set(job.id, job);
+  (async () => {
+    for (const args of steps) {
+      job.log += `$ ${args.map((a) => a.replace(MEMORY_WORLDS + "/", "")).join(" ")}\n`;
+      await runPython(project, args, (s) => (job.log += s));
+    }
+  })().then(
+    () => (job.status = "done"),
+    (error) => {
+      job.status = "failed";
+      job.log += `\n${error.message}\n`;
+    },
+  );
+  return job;
+}
+
+// ---------------------------------------------------------------- projects on disk
+function projectDir(id: string) {
+  if (!/^[a-z0-9][a-z0-9-]{0,60}$/.test(id))
+    throw new Error("Bad project name");
+  return join(PROJECTS, id);
+}
+const readJson = (path: string, fallback: any = null) =>
+  existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : fallback;
+function writeJson(path: string, value: unknown) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(value, null, 1));
+}
+const placeConfig = (id: string) =>
+  readJson(join(projectDir(id), "places.json"), {})[id];
+const setPlaceConfig = (id: string, cfg: unknown) =>
+  writeJson(join(projectDir(id), "places.json"), { [id]: cfg });
+const genDir = (id: string, tag: string) => {
+  if (!/^[a-z0-9][a-z0-9-]{0,40}$/.test(tag)) throw new Error("Bad take name");
+  return join(projectDir(id), "work", "gen", `${id}-${tag}`);
+};
+
+function generations(id: string) {
+  const dir = join(projectDir(id), "work", "gen");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((name) => name.startsWith(id + "-"))
+    .map((name) => {
+      const gen = join(dir, name);
+      const frames = readdirSync(gen).filter((f) => /^frame-\d+\.png$/.test(f));
+      return {
+        tag: name.slice(id.length + 1),
+        targets: readJson(join(gen, "targets.json"), []),
+        settings: readJson(join(gen, "settings.json")),
+        frames: frames.length,
+        submitted: existsSync(join(gen, "result.json")),
+        cloud: existsSync(join(gen, "cloud.ply")),
+        exported: existsSync(join(projectDir(id), "export", name)),
+      };
+    });
+}
+
+function projectState(id: string) {
+  const dir = projectDir(id);
+  const cfg = placeConfig(id);
+  const scene = join(dir, "work", "scene", id);
+  return {
+    id,
+    config: cfg,
+    editor: readJson(join(dir, "project.json"), {}),
+    posed: readJson(join(dir, "work", "pose", id, "posed.json")),
+    terrain: existsSync(join(dir, "source", "aerial", id, "meta.json")),
+    context: readJson(join(scene, "context.json")),
+    registration: existsSync(join(scene, "check-registration.jpg")),
+    generations: generations(id),
+    jobs: [...jobs.values()].filter((j) => j.project === id),
+  };
+}
+
+// What a new place needs in places.json (the October tools read it); values as for Big Sur.
+const newPlaceConfig = (
+  photo: string,
+  lat: number,
+  lon: number,
+  heading: number,
+) => ({
+  photo,
+  gps: [lat, lon],
+  heading_deg: heading,
+  heading_from: "atlas-studio",
+  camera_height_m: 1.5,
+  ground_region: [1.0, 1.0, 0.75],
+  aerial_views: { "aerial-mid": [900, 600], "aerial-close": [450, 520] },
+  target_hfov: 75,
+  approach: {
+    frames: 10,
+    start_alt_m: 450,
+    start_pitch_deg: -70,
+    pitch_curve: 1.4,
+    min_glide_deg: 15,
+    start_side_m: 0,
+  },
 });
-const runner = new JobRunner(ledger, resolve(data, "jobs"));
-const stripe = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY)
-  : null;
+
+// ---------------------------------------------------------------- http
 const app = express();
 app.disable("x-powered-by");
-app.use((req, res, next) => {
-  if (
-    (!hosted || loopbackOrigin) &&
-    !["127.0.0.1", "localhost", "[::1]"].includes(req.hostname)
-  ) {
-    res
-      .status(403)
-      .json({ error: "Local mode only accepts localhost requests." });
-    return;
-  }
-  next();
-});
-app.use((_req, res, next) => {
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("Referrer-Policy", "no-referrer");
-  res.setHeader("X-Frame-Options", "DENY");
-  next();
-});
+app.use(express.json({ limit: "60mb" }));
+const route =
+  (handler: (req: express.Request) => unknown) =>
+  async (req: express.Request, res: express.Response) => {
+    try {
+      res.json(await handler(req));
+    } catch (error) {
+      res
+        .status(400)
+        .json({
+          error: error instanceof Error ? error.message : String(error),
+        });
+    }
+  };
 
-app.post(
-  "/api/stripe/webhook",
-  express.raw({ type: "application/json", limit: "1mb" }),
-  async (req, res) => {
-    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
-      res.sendStatus(503);
-      return;
-    }
-    let event: Stripe.Event;
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        req.header("stripe-signature") || "",
-        process.env.STRIPE_WEBHOOK_SECRET,
-      );
-    } catch {
-      res.status(400).json({ error: "Invalid webhook signature" });
-      return;
-    }
-    try {
-      if (
-        [
-          "checkout.session.completed",
-          "checkout.session.async_payment_succeeded",
-        ].includes(event.type)
-      ) {
-        await fulfillCheckout(
-          stripe,
-          ledger,
-          event.data.object as Stripe.Checkout.Session,
-          process.env.STRIPE_PRICE_ID!,
-        );
-      }
-      if (
-        event.type === "charge.refunded" ||
-        event.type === "charge.dispute.created"
-      ) {
-        const object = event.data.object as any;
-        const charge =
-          event.type === "charge.refunded"
-            ? object
-            : await stripe.charges.retrieve(
-                typeof object.charge === "string"
-                  ? object.charge
-                  : object.charge.id,
-              );
-        if (event.type === "charge.dispute.created" || charge.refunded) {
-          const paymentIntent =
-            typeof charge.payment_intent === "string"
-              ? charge.payment_intent
-              : charge.payment_intent?.id;
-          if (paymentIntent) {
-            const sessions = await stripe.checkout.sessions.list({
-              payment_intent: paymentIntent,
-              limit: 10,
-            });
-            for (const session of sessions.data)
-              if (session.metadata?.app === "marble-camera-studio")
-                ledger.reversePayment(session.id);
-          }
-        }
-      }
-      res.json({ received: true });
-    } catch {
-      console.error("Stripe event processing failed", {
-        id: event.id,
-        type: event.type,
-      });
-      res.sendStatus(500);
-    }
-  },
+app.get(
+  "/api/projects",
+  route(() =>
+    readdirSync(PROJECTS)
+      .filter((id) => existsSync(join(PROJECTS, id, "places.json")))
+      .map((id) => ({
+        id,
+        photo: placeConfig(id)?.photo,
+        gps: placeConfig(id)?.gps,
+      })),
+  ),
 );
-app.use(express.json({ limit: "7mb" }));
-app.get("/api/config", (_req, res) =>
-  res.json({
-    mode,
-    clerkPublishableKey: hosted ? process.env.CLERK_PUBLISHABLE_KEY : null,
-    freeCredits: 3,
-    creditPacks: CREDIT_PACKS.map(({ id, credits, priceCents }) => ({
+
+// A new project from a photo: save it, read its GPS point and heading from EXIF.
+app.post(
+  "/api/projects",
+  route(async (req) => {
+    const { name, fileName, base64 } = req.body;
+    const id = String(name)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "");
+    const dir = projectDir(id);
+    if (existsSync(dir))
+      throw new Error(`A project called ${id} exists already.`);
+    const photo = `source/photos/${id}${extname(String(fileName)).toLowerCase() || ".jpg"}`;
+    mkdirSync(join(dir, "source", "photos"), { recursive: true });
+    writeFileSync(join(dir, photo), Buffer.from(base64, "base64"));
+    const exif = lastJson(
+      await runPython(id, [studioTool, "exif", join(dir, photo)], () => {}),
+    );
+    setPlaceConfig(
       id,
-      credits,
-      priceCents,
-    })),
-    packCredits: PACK_CREDITS,
-    packPriceCents: PACK_CENTS,
-    frames: FRAMES,
-    fps: FPS,
-    apiConfigured: !!process.env.WLT_API_KEY,
-    repoUrl:
-      process.env.REPOSITORY_URL ||
-      "https://github.com/worldlabsai/atlas-camera-studio",
+      newPlaceConfig(photo, exif.lat ?? 0, exif.lon ?? 0, exif.heading ?? 0),
+    );
+    writeJson(join(dir, "project.json"), { exif });
+    return projectState(id);
   }),
 );
-app.get("/api/health", (_req, res) => res.json({ ok: true, mode }));
-if (hosted) app.use(clerkMiddleware({ authorizedParties: [origin] }));
-app.use("/api", async (req, res, next) => {
-  res.setHeader("Cache-Control", "no-store");
-  if (["POST", "PUT", "DELETE", "PATCH"].includes(req.method)) {
-    const received = req.header("origin");
-    const allowed = new Set([
-      origin,
-      ...(!hosted
-        ? [
-            "http://127.0.0.1:5173",
-            "http://localhost:5173",
-            "http://localhost:3030",
-          ]
-        : []),
+
+app.get(
+  "/api/projects/:id",
+  route((req) => projectState(String(req.params.id))),
+);
+
+// The editor's own state (camera path, output settings): project.json.
+app.put(
+  "/api/projects/:id/editor",
+  route((req) => {
+    const file = join(projectDir(String(req.params.id)), "project.json");
+    writeJson(file, { ...readJson(file, {}), ...req.body });
+    return { saved: true };
+  }),
+);
+
+// GPS point, heading and photo strips (places.json). A moved point makes the fetched terrain stale.
+app.put(
+  "/api/projects/:id/config",
+  route((req) => {
+    const id = String(req.params.id);
+    const cfg = placeConfig(id);
+    const { gps, heading_deg, strips_down_deg } = req.body;
+    if (gps && (gps[0] !== cfg.gps[0] || gps[1] !== cfg.gps[1]))
+      rmSync(join(projectDir(id), "source", "aerial", id), {
+        recursive: true,
+        force: true,
+      });
+    setPlaceConfig(id, {
+      ...cfg,
+      ...(gps && { gps }),
+      ...(heading_deg !== undefined && { heading_deg }),
+      ...(strips_down_deg !== undefined && { strips_down_deg }),
+    });
+    return projectState(id);
+  }),
+);
+
+// images2PosedRGBD spends World Labs credits: only on an explicit confirmation, and never again once cached.
+app.post(
+  "/api/projects/:id/pose",
+  route((req) => {
+    const id = String(req.params.id);
+    if (req.body?.confirm !== true)
+      throw new Error("Posing spends World Labs credits; confirm it first.");
+    if (existsSync(join(projectDir(id), "work", "pose", id, "posed.json")))
+      throw new Error(
+        "This photo is posed already; the cached pose (work/pose) is used.",
+      );
+    const { width = 3, height = 4 } =
+      readJson(join(projectDir(id), "project.json"), {}).exif ?? {};
+    const res =
+      height > width
+        ? ["768", "1024"]
+        : width / height > 1.7
+          ? ["1280", "720"]
+          : ["1024", "768"];
+    return startJob(id, "Pose the photo (images2PosedRGBD)", [
+      [
+        tool("pose.py"),
+        id,
+        join(projectDir(id), placeConfig(id).photo),
+        "--res",
+        ...res,
+      ],
     ]);
-    if (received && !allowed.has(received)) {
-      res.status(403).json({ error: "Request origin is not allowed." });
-      return;
-    }
-  }
-  if (hosted) {
-    const { userId } = getAuth(req);
-    if (!userId) {
-      res.status(401).json({ error: "Sign in to continue." });
-      return;
-    }
-    try {
-      const user = await clerkClient.users.getUser(userId);
-      const phone =
-        user.phoneNumbers.find(
-          (p) =>
-            p.id === user.primaryPhoneNumberId &&
-            p.verification?.status === "verified",
-        ) ||
-        user.phoneNumbers.find((p) => p.verification?.status === "verified");
-      const phoneHash = phone
-        ? createHmac("sha256", process.env.PHONE_HASH_SECRET!)
-            .update(phone.phoneNumber)
-            .digest("hex")
-        : null;
-      res.locals.userId = userId;
-      res.locals.verified = !!phone;
-      res.locals.account = ledger.account(userId, phoneHash);
-    } catch (error) {
-      next(error);
-      return;
-    }
-  } else {
-    res.locals.userId = "local";
-    res.locals.verified = true;
-    ledger.account("local", "local");
-    ledger.creditPayment("local", "local-development", 100000);
-    res.locals.account = ledger.getAccount("local");
-  }
-  next();
-});
-app.get("/api/account", (_req, res) =>
-  res.json({ ...res.locals.account, phoneVerified: res.locals.verified }),
+  }),
 );
-function cleanJob(job: any) {
-  const { payload, userId, operationId, ...safe } = job;
-  return safe;
-}
-app.get("/api/jobs", (_req, res) =>
-  res.json(ledger.listJobs(res.locals.userId).map(cleanJob)),
+
+// USGS 3DEP elevation and NAIP imagery around the point (free, US only).
+app.post(
+  "/api/projects/:id/terrain",
+  route((req) => {
+    const id = String(req.params.id);
+    const [lat, lon] = placeConfig(id).gps;
+    return startJob(id, "Fetch USGS terrain and imagery", [
+      [
+        tool("fetch_aerial.py"),
+        join(projectDir(id), "source", "aerial"),
+        "--place",
+        id,
+        String(lat),
+        String(lon),
+      ],
+    ]);
+  }),
 );
-app.get("/api/jobs/:id", (req, res) => {
-  const job = ledger.getJob(res.locals.userId, String(req.params.id));
-  if (!job) {
-    res.status(404).json({ error: "Job not found." });
-    return;
-  }
-  res.json(cleanJob(job));
-});
-app.use(
-  ["/api/jobs/pose", "/api/jobs/generate", "/api/checkout"],
-  (_req, res, next) => {
-    if (!res.locals.verified) {
-      res.status(403).json({
-        error: "Verify a phone number in your account to continue.",
-        code: "phone_required",
-      });
-      return;
-    }
-    next();
-  },
+
+// Place the photo in the local frame and render the aerial context frames (free).
+app.post(
+  "/api/projects/:id/scene",
+  route((req) => {
+    const id = String(req.params.id);
+    return startJob(id, "Build the context frames", [
+      [tool("build_place.py"), id],
+    ]);
+  }),
 );
-app.post("/api/jobs/pose", (req, res) => {
-  if (!process.env.WLT_API_KEY) {
-    res.status(503).json({
-      error: "Set WLT_API_KEY on the server before preparing an image.",
-    });
-    return;
-  }
-  const payload = poseSchema.parse(req.body);
-  const bytes = Buffer.from(payload.image.base64, "base64");
-  const valid =
-    payload.image.mimeType === "image/jpeg"
-      ? bytes[0] === 255 && bytes[1] === 216
-      : payload.image.mimeType === "image/png"
-        ? bytes
-            .subarray(0, 8)
-            .equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
-        : bytes.toString("ascii", 0, 4) === "RIFF" &&
-          bytes.toString("ascii", 8, 12) === "WEBP";
-  if (!valid) {
-    res.status(400).json({ error: "Upload a valid JPEG, PNG, or WebP image." });
-    return;
-  }
-  const job = ledger.reserve(res.locals.userId, payload.key, "pose", payload);
-  void runner.start(job.id, res.locals.userId);
-  res.status(202).json(cleanJob(job));
-});
-app.post("/api/jobs/generate", (req, res) => {
-  const payload = generateSchema.parse(req.body);
-  const source = ledger.getJob(res.locals.userId, payload.poseJobId);
-  if (
-    payload.poseJobId !== EXAMPLE_ID &&
-    (source?.kind !== "pose" || source.status !== "succeeded")
-  ) {
-    res.status(400).json({ error: "Prepare an image before generating." });
-    return;
-  }
-  const job = ledger.reserve(
-    res.locals.userId,
-    payload.key,
-    "generate",
-    payload,
-  );
-  void runner.start(job.id, res.locals.userId);
-  res.status(202).json(cleanJob(job));
-});
-app.get("/api/jobs/:id/media", async (req, res) => {
-  const job = ledger.getJob(res.locals.userId, String(req.params.id));
-  const index = Number(req.query.frame || 0);
-  if (
-    !job ||
-    job.status !== "succeeded" ||
-    !Number.isInteger(index) ||
-    index < 0 ||
-    index >= FRAMES
-  ) {
-    res.sendStatus(404);
-    return;
-  }
-  const frame = (job.result as TaskResult)?.frames?.[index];
-  const depth = req.query.kind === "depth";
-  const asset = depth ? frame?.depth?.depthAsset : frame?.imageAsset;
-  if (!asset) {
-    res.sendStatus(404);
-    return;
-  }
-  const bytes = await readAsset(asset);
-  const imageType =
-    bytes[0] === 255 && bytes[1] === 216
-      ? "image/jpeg"
-      : bytes.toString("ascii", 0, 4) === "RIFF"
-        ? "image/webp"
-        : "image/png";
-  res.type(depth ? "image/x-exr" : imageType).send(bytes);
-});
-app.get("/api/jobs/:id/video", (req, res) => {
-  const job = ledger.getJob(res.locals.userId, String(req.params.id));
-  if (
-    job?.kind !== "generate" ||
-    job.status !== "succeeded" ||
-    !(job.result as TaskResult)?.videoReady
-  ) {
-    res.sendStatus(404);
-    return;
-  }
-  res.download(runner.videoPath(job.id), "marble-camera-" + job.id + ".mp4");
-});
-app.post("/api/checkout", async (req, res) => {
-  if (!hosted || !stripe) {
-    res
-      .status(400)
-      .json({ error: "Billing is only available on the hosted app." });
-    return;
-  }
-  const pack = checkoutPack(req.body);
-  const session = await stripe.checkout.sessions.create({
-    mode: "payment",
-    allowed_payment_method_types: ["card"],
-    line_items: [
-      { price: process.env.STRIPE_PRICE_ID!, quantity: pack.quantity },
-    ],
-    client_reference_id: res.locals.userId,
-    metadata: {
-      app: "marble-camera-studio",
-      userId: res.locals.userId,
-      packId: pack.id,
-    },
-    success_url: origin + "/?checkout=success",
-    cancel_url: origin + "/?checkout=cancelled",
-  });
-  res.json({ url: session.url });
-});
-app.use("/api", (_req, res) => res.status(404).json({ error: "Not found." }));
-app.use(express.static(resolve("dist"), { index: false }));
-app.get("/{*path}", (_req, res) => res.sendFile(resolve("dist/index.html")));
-app.use(
-  (
-    error: unknown,
-    _req: express.Request,
-    res: express.Response,
-    _next: express.NextFunction,
-  ) => {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        error: "Please check the request fields.",
-        details: error.issues.map((i) => ({
-          path: i.path,
-          message: i.message,
-        })),
-      });
-      return;
-    }
-    if (error instanceof LedgerError) {
-      res.status(error.status).json({ error: error.message, code: error.code });
-      return;
-    }
-    if (
-      error instanceof SyntaxError &&
-      "status" in error &&
-      error.status === 400
-    ) {
-      res.status(400).json({ error: "Invalid JSON request." });
-      return;
-    }
-    if (
-      error &&
-      typeof error === "object" &&
-      "status" in error &&
-      error.status === 413
-    ) {
-      res.status(413).json({ error: "The upload is too large." });
-      return;
-    }
-    console.error("Request failed", {
-      type: error instanceof Error ? error.name : "unknown",
-    });
-    res.status(500).json({ error: "Something went wrong. Please try again." });
-  },
+
+// The dry run: write the path's cameras and settings and build the request with local files. Sends nothing.
+app.post(
+  "/api/projects/:id/generations",
+  route(async (req) => {
+    const id = String(req.params.id);
+    const { tag, targets, settings } = req.body;
+    const gen = genDir(id, String(tag));
+    if (existsSync(join(gen, "result.json")))
+      throw new Error(`Take ${tag} was generated already; name a new one.`);
+    writeJson(join(gen, "targets.json"), targets);
+    writeJson(join(gen, "settings.json"), settings);
+    return lastJson(
+      await runPython(id, [studioTool, "request", id, tag], () => {}),
+    );
+  }),
 );
-const port = Number(process.env.PORT || 3030);
-const host = hosted && !loopbackOrigin ? "0.0.0.0" : "127.0.0.1";
-const server = app.listen(port, host, () => {
+
+// atlasGenerate spends credits: only after a dry run and an explicit confirmation of its cost. Then the frames are
+// fused into a dot cloud and the request is exported as a package.
+const cloudStep = (id: string, tag: string) => [
+  tool("place_cloud.py"),
+  id,
+  "--tag",
+  tag,
+  "--radius",
+  "800",
+  "--max-depth",
+  "2000",
+  "--out",
+  join(genDir(id, tag), "cloud.ply"),
+];
+app.post(
+  "/api/projects/:id/generations/:tag/submit",
+  route((req) => {
+    const id = String(req.params.id);
+    const tag = String(req.params.tag);
+    const gen = genDir(id, tag);
+    const local = readJson(join(gen, "request-local.json"));
+    if (!local) throw new Error("Review the request (dry run) first.");
+    const credits = CREDITS_PER_VIEW * local.targetCameras.length;
+    if (req.body?.confirm !== true || req.body?.credits !== credits)
+      throw new Error(
+        `Generating spends ~${credits} credits; confirm that amount first.`,
+      );
+    if (existsSync(join(gen, "result.json")))
+      throw new Error(`Take ${tag} was generated already.`);
+    return startJob(id, `Generate ${tag} (atlasGenerate)`, [
+      [studioTool, "submit", id, tag],
+      cloudStep(id, tag),
+      [tool("export_request.py"), id, tag],
+    ]);
+  }),
+);
+
+// Fuse or export a generated take again (free).
+app.post(
+  "/api/projects/:id/generations/:tag/cloud",
+  route((req) => {
+    const id = String(req.params.id);
+    const tag = String(req.params.tag);
+    return startJob(id, `Dot cloud for ${tag}`, [cloudStep(id, tag)]);
+  }),
+);
+app.post(
+  "/api/projects/:id/generations/:tag/export",
+  route((req) => {
+    const id = String(req.params.id);
+    const tag = String(req.params.tag);
+    return startJob(id, `Export ${tag}`, [
+      [tool("export_request.py"), id, tag],
+    ]);
+  }),
+);
+
+app.get(
+  "/api/jobs/:id",
+  route((req) => {
+    const job = jobs.get(String(req.params.id));
+    if (!job) throw new Error("No such job");
+    return job;
+  }),
+);
+
+// The projects' files (photos, context frames, generated views), read by the editor.
+app.use("/files", express.static(PROJECTS, { dotfiles: "deny" }));
+app.use(express.static(join(STUDIO, "dist"), { index: false }));
+app.get("/{*path}", (_req, res) =>
+  res.sendFile(join(STUDIO, "dist", "index.html")),
+);
+
+app.listen(PORT, "127.0.0.1", () =>
   console.log(
-    "Camera Studio listening on " +
-      host +
-      ":" +
-      (server.address() as import("node:net").AddressInfo).port +
-      " (" +
-      mode +
-      ")",
-  );
-  runner.resume();
-  void runner.prune();
-});
-const cleanupTimer = setInterval(() => void runner.prune(), 60 * 60 * 1000);
-cleanupTimer.unref();
-function shutdown() {
-  clearInterval(cleanupTimer);
-  runner.stop();
-  server.close(() => {
-    ledger.close();
-    process.exit(0);
-  });
-  setTimeout(() => process.exit(0), 5000).unref();
-}
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+    `Atlas map studio on http://127.0.0.1:${PORT} (projects in ${PROJECTS})`,
+  ),
+);

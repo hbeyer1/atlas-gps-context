@@ -1,5 +1,5 @@
 {
-  "name": "atlas-camera-studio",
+  "name": "atlas-map-studio",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -7,33 +7,27 @@
     "node": ">=22.12"
   },
   "scripts": {
+    "prestart": "vite build",
     "dev": "tsx watch server/index.ts",
     "build": "vite build",
     "start": "tsx server/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts && npm run test:trajectory",
-    "format": "prettier --write src server tests docs README.md SECURITY.md",
-    "test:trajectory": "vitest run src/trajectory/camera-trajectory.spec.ts"
+    "test:trajectory": "vitest run src/trajectory/camera-trajectory.spec.ts",
+    "format": "prettier --write src server tests README.md"
   },
   "dependencies": {
-    "@clerk/express": "^2.1.76",
-    "@clerk/react": "^6.17.6",
     "@react-three/drei": "^10.7.9",
     "@react-three/fiber": "^9.8.1",
-    "@tanstack/react-query": "^5.104.1",
-    "better-sqlite3": "^13.0.3",
-    "dotenv": "^18.0.5",
     "express": "^5.2.1",
     "lucide-react": "^1.52.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
-    "stripe": "^23.0.0",
     "three": "^0.186.1",
-    "zod": "^4.6.5"
+    "leaflet": "^1.9.4"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
-    "@types/better-sqlite3": "^9.6.0",
     "@types/express": "^5.0.6",
     "@types/node": "^26.6.4",
     "@types/react": "^19.3.0",
@@ -45,6 +39,7 @@
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vite": "^8.3.2",
-    "vitest": "^5.0.3"
+    "vitest": "^5.0.3",
+    "@types/leaflet": "^1.9.20"
   }
 }

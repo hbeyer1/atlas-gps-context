@@ -8,6 +8,8 @@ export type PointCloudData = {
   colors: Float32Array;
   medianDepth: number;
   focus: [number, number, number];
+  /** World size of one dot at the median depth, so neighbouring dots just touch. */
+  pointSize: number;
 };
 export async function decodePointCloud(
   imageResponse: Response,
@@ -96,6 +98,7 @@ export async function decodePointCloud(
       colors: new Float32Array(colors),
       medianDepth,
       focus: [focus.x, focus.y, focus.z],
+      pointSize: (2 * medianDepth * stride) / sx / intrinsics.fx,
     };
   } finally {
     bitmap.close();

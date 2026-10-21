@@ -1,23 +1,18 @@
-import { EXAMPLE_DEPTH, EXAMPLE_IMAGE, EXAMPLE_HANDOFF } from "../example";
 import {
   useEffect,
   useMemo,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
   type RefObject,
 } from "react";
-import { useQuery } from "@tanstack/react-query";
 import {
-  ArrowLeft,
   ChevronDown,
-  Copy,
-  Download,
-  ExternalLink,
-  FolderOpen,
-  History as HistoryIcon,
-  House,
-  Loader2,
+  Eye,
+  EyeOff,
+  Image as ImageIcon,
+  Map as MapIcon,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
@@ -25,31 +20,34 @@ import {
   Pause,
   Play,
   Plus,
-  Rotate3D,
-  Undo2,
   Redo2,
-  Save,
-  Send,
+  Rotate3D,
   Sparkles,
-  Stamp,
-  Star,
   Trash2,
-  Upload,
+  Undo2,
   X,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { verticalFov, type PinholeCamera } from "./common";
-import * as THREE from "three";
-import { CameraPointCloudView, CameraTrajectoryCanvas } from "./Canvas";
 import {
-  appendDrawnTrajectory,
-  buildTargetCameras,
+  createIntrinsicsFromFov,
+  verticalFov,
+  type PinholeCamera,
+} from "./common";
+import * as THREE from "three";
+import {
+  CameraPointCloudView,
+  CameraTrajectoryCanvas,
+  frameBox,
+} from "./Canvas";
+import {
   cameraAimDegrees,
   cameraDrawingView,
   cameraQuaternionFromAim,
   cameraTargetIsClearOfPath,
+  cameraViewLookingAt,
   cameraViewsFromSegments,
+  buildTargetCameras,
   deleteTrajectoryPivot,
   frameTrajectorySpaceAboveFloor,
   insertTrajectoryPivot,
@@ -68,6 +66,7 @@ import {
   trajectoryPathFromSegments,
   trajectoryPivotsFromSegments,
   trajectoryFloorBoundary,
+  appendDrawnTrajectory,
   type CameraDirectionMode,
   type CameraView,
   type DrawPoint,
@@ -79,56 +78,23 @@ import {
   type TrajectoryShape,
   type TrajectorySpace,
 } from "./camera-trajectory";
-import {
-  blobToDataUrl,
-  cameraTrajectoryVideoUrl,
-  deleteCameraTrajectoryGeneration,
-  getCameraTrajectoryDraft,
-  getCameraTrajectoryDrafts,
-  getCameraTrajectoryHistory,
-  getCameraTrajectoryStatus,
-  saveCameraTrajectoryDraft,
-  setCameraTrajectoryDraftStar,
-  setCameraTrajectoryGenerationStar,
-  submitCameraTrajectory,
-  type CameraTrajectoryAspectRatio,
-  type CameraTrajectoryDraftDetails,
-  type CameraTrajectoryDraftSummary,
-  type CameraTrajectoryHistoryItem,
-  type CameraTrajectoryHistoryVariant,
-} from "./api";
-import { authFetch, type GetToken } from "./client";
 import { useEditHistory } from "./use-edit-history";
-import { loadDepthPointCloud, loadExamplePose } from "./pose";
-import { fileToPoseBlob, posePointClouds, type PosedView } from "./pose";
+import type { Frame, Scene } from "../scene";
+
+type CameraTrajectoryAspectRatio = "16:9" | "9:16";
 
 const DEFAULT_FRAME_COUNT = 48;
 const DEFAULT_FPS = 12;
-const DEFAULT_SEED_COUNT = 1;
-const DEFAULT_CFG = 2.5;
-const DEFAULT_FREEZE_TIME = true;
 const DEFAULT_DIRECTION_MODE: CameraDirectionMode = "manual";
+const DEFAULT_HFOV_DEGREES = 75; // the October pipeline's target_hfov
 const MIN_FRAME_COUNT = 2;
-const MAX_FRAME_COUNT = 48;
-const MIN_FPS = 1;
-const MAX_FPS = 60;
-const MIN_SEED_COUNT = 1;
-const MAX_SEED_COUNT = 16;
-const MIN_CFG = 0;
-const MAX_CFG = 15;
+const MAX_FRAME_COUNT = 96;
 const MIN_TARGET_FOV_DEGREES = 5;
 const MAX_TARGET_FOV_DEGREES = 140;
-const DEFAULT_ASPECT_RATIO: CameraTrajectoryAspectRatio = "16:9";
-const PORTRAIT_GENERATION_ENABLED = false;
-const TARGET_FORMATS: Record<
-  CameraTrajectoryAspectRatio,
-  { width: number; height: number }
-> = {
-  "16:9": { width: 1280, height: 720 },
-  "9:16": { width: 400, height: 720 },
-};
-const FIRST_GENERATION_SEED = 42;
-const MAX_DEPTH_ANCHORS = 16;
+const WIDTH = 1280;
+const HEIGHT = 720;
+// The draw pad's width in metres: a walk around the spot, a circle above it, the whole descent.
+const PAD_WIDTHS = [10, 40, 150, 600, 1500];
 const DRAWING_PANEL_SIZES = [
   { label: "Small", widthClass: "w-80" },
   { label: "Medium", widthClass: "w-[26rem]" },
@@ -170,228 +136,182 @@ function isPointDirectionMode(
   return mode === "look_at" || mode === "look_away";
 }
 
-function restoredDirectionMode(
-  mode: CameraDirectionMode | undefined,
-): CameraDirectionMode {
-  if (mode === "inward") return "look_at";
-  if (mode === "outward") return "look_away";
-  return mode ?? DEFAULT_DIRECTION_MODE;
-}
-
 type SelectedPivot = {
   segmentId: string;
   pointIndex: number;
   pivotNumber: number;
 };
 
-export function mergeHistoryItems(
-  optimistic: readonly CameraTrajectoryHistoryItem[],
-  persisted: readonly CameraTrajectoryHistoryItem[],
-): CameraTrajectoryHistoryItem[] {
-  const byIteration = new Map<string, CameraTrajectoryHistoryItem>();
-  for (const item of [...optimistic, ...persisted]) {
-    const current = byIteration.get(item.iteration_id);
-    if (!current) {
-      byIteration.set(item.iteration_id, {
-        ...item,
-        variants: visibleHistoryVariants(item.variants),
-      });
-      continue;
-    }
-    byIteration.set(item.iteration_id, {
-      ...current,
-      ...item,
-      submitted_at: Math.max(current.submitted_at, item.submitted_at),
-      variants: visibleHistoryVariants([...current.variants, ...item.variants]),
-    });
-  }
-  return [...byIteration.values()].sort(
-    (left, right) => right.submitted_at - left.submitted_at,
+const hfovToVfov = (degrees: number) =>
+  THREE.MathUtils.radToDeg(
+    2 *
+      Math.atan(
+        (Math.tan(THREE.MathUtils.degToRad(degrees) / 2) * HEIGHT) / WIDTH,
+      ),
   );
-}
-
-function visibleHistoryVariants(
-  variants: readonly CameraTrajectoryHistoryVariant[],
-): CameraTrajectoryHistoryVariant[] {
-  const byJob = new Map<string, CameraTrajectoryHistoryVariant>();
-  for (const variant of variants) {
-    const existing = byJob.get(variant.job_id);
-    if (!existing || variant.submitted_at > existing.submitted_at) {
-      byJob.set(variant.job_id, {
-        ...variant,
-        starred: variant.starred || existing?.starred || false,
-      });
-    } else if (variant.starred && !existing.starred) {
-      byJob.set(variant.job_id, { ...existing, starred: true });
-    }
-  }
-
-  const visibleByJob = new Map(
-    [...byJob.values()]
-      .filter((variant) => variant.starred)
-      .map((variant) => [variant.job_id, variant]),
+const vfovToHfov = (degrees: number) =>
+  THREE.MathUtils.radToDeg(
+    2 *
+      Math.atan(
+        (Math.tan(THREE.MathUtils.degToRad(degrees) / 2) * WIDTH) / HEIGHT,
+      ),
   );
-  const newestBySeed = new Map<string, CameraTrajectoryHistoryVariant>();
-  for (const variant of byJob.values()) {
-    const key =
-      variant.seed === null ? `job:${variant.job_id}` : `seed:${variant.seed}`;
-    const aspectKey = `${variant.aspect_ratio}:${key}`;
-    const existing = newestBySeed.get(aspectKey);
-    if (!existing || variant.submitted_at > existing.submitted_at) {
-      newestBySeed.set(aspectKey, variant);
-    }
-  }
-  for (const variant of newestBySeed.values()) {
-    visibleByJob.set(variant.job_id, variant);
-  }
-  return [...visibleByJob.values()];
-}
 
-export function generationSeeds(seedCount: number): number[] {
-  const count = Math.min(
-    MAX_SEED_COUNT,
-    Math.max(MIN_SEED_COUNT, Math.round(seedCount)),
-  );
-  return Array.from(
-    { length: count },
-    (_, index) => FIRST_GENERATION_SEED + index,
-  );
-}
-
-export function cameraTrajectoryCfgLabel(cfg: number | undefined): string {
-  return (cfg ?? DEFAULT_CFG).toFixed(1);
-}
-
-export function cameraTrajectoryTimeLabel(
-  freezeTime: boolean | undefined,
-): "Frozen" | "Moving" {
-  return (freezeTime ?? DEFAULT_FREEZE_TIME) ? "Frozen" : "Moving";
-}
-
-export function favoriteHistoryItems(
-  items: readonly CameraTrajectoryHistoryItem[],
-): CameraTrajectoryHistoryItem[] {
-  return items
-    .flatMap((item) => {
-      const variants = item.variants.filter((variant) => variant.starred);
-      if (variants.length === 0) return [];
-      const newest = variants.reduce((current, variant) =>
-        variant.submitted_at > current.submitted_at ? variant : current,
-      );
-      return [
-        {
-          ...item,
-          submitted_at: newest.submitted_at,
-          prompt: newest.prompt ?? item.prompt,
-          target_frame_count:
-            newest.target_frame_count ?? item.target_frame_count,
-          fps: newest.fps ?? item.fps,
-          aspect_ratio: newest.aspect_ratio,
-          variants,
-        },
-      ];
-    })
-    .sort((left, right) => right.submitted_at - left.submitted_at);
-}
-
-export function applyGenerationStarOverrides(
-  items: readonly CameraTrajectoryHistoryItem[],
-  overrides: ReadonlyMap<string, boolean>,
-): CameraTrajectoryHistoryItem[] {
-  return items.map((item) => {
-    let changed = false;
-    const variants = item.variants.map((variant) => {
-      const starred = overrides.get(variant.job_id);
-      if (starred === undefined || starred === variant.starred) return variant;
-      changed = true;
-      return { ...variant, starred };
-    });
-    return changed ? { ...item, variants } : item;
-  });
-}
-
-export function applyDraftStarOverrides(
-  drafts: readonly CameraTrajectoryDraftSummary[],
-  overrides: ReadonlyMap<string, boolean>,
-): CameraTrajectoryDraftSummary[] {
-  return drafts.map((draft) => {
-    const starred = overrides.get(draft.draft_id);
-    return starred === undefined || starred === draft.starred
-      ? draft
-      : { ...draft, starred };
-  });
-}
-
-export function removeHistoryJob(
-  items: readonly CameraTrajectoryHistoryItem[],
-  jobId: string,
-): CameraTrajectoryHistoryItem[] {
-  return items.flatMap((item) => {
-    const variants = item.variants.filter(
-      (variant) => variant.job_id !== jobId,
-    );
-    return variants.length > 0 ? [{ ...item, variants }] : [];
-  });
-}
-
-export function cameraTrajectoryDownloadName({
-  prompt,
-  iterationId,
-  jobId,
-  seed,
-  frameCount,
-  fps,
-  aspectRatio,
-}: {
-  prompt: string;
-  iterationId: string;
-  jobId: string;
-  seed: number | null;
+// What project.json keeps of the editor.
+export type EditorState = {
+  segments: TrajectorySegment[];
+  trajectorySmoothingVersion: number;
+  directionMode: CameraDirectionMode;
+  directionTarget: TrajectoryPoint | null;
+  closedLoop: boolean;
+  allowBelowFloor: boolean;
+  targetFovDegrees: number;
   frameCount: number;
   fps: number;
-  aspectRatio: CameraTrajectoryAspectRatio;
-}): string {
-  const sceneName =
-    prompt
-      .normalize("NFKD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[^a-zA-Z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .toLowerCase()
-      .slice(0, 48)
-      .replace(/-+$/g, "") || "scene";
-  const aspectName = aspectRatio.replace(":", "x");
-  return `${sceneName}--iteration-${iterationId}--seed-${seed ?? "unknown"}--job-${jobId}--${aspectName}--${frameCount}frames-${fps}fps.mp4`;
+};
+
+export type Mode = "place" | "frame" | "video";
+export type Take = {
+  tag: string;
+  frames: { image: string; camera: PinholeCamera; label: string }[];
+  /** The fused dot cloud (place_cloud.py), once made. */
+  cloud: string | null;
+};
+type ViewFrom = { label: string; view: CameraView; image?: string };
+
+// Ready-made parts, in the spirit of the October pipeline: a descent onto the photo spot, a circle at eye level
+// around what the photo looks at, a walk around the spot. Each point carries its camera's direction.
+type PresetKind = "descent" | "circle" | "walk";
+function presetPart(kind: PresetKind, scene: Scene, fovRadians: number) {
+  const photo = scene.reference.extrinsics;
+  const P = new THREE.Vector3(...photo.position);
+  const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(
+    new THREE.Quaternion(...photo.quaternion),
+  );
+  const heading = new THREE.Vector3(forward.x, 0, forward.z).normalize();
+  const look = (position: THREE.Vector3, target: THREE.Vector3) =>
+    cameraViewLookingAt("", position.toArray(), target.toArray(), fovRadians)
+      .quaternion;
+  const views: { point: TrajectoryPoint; quaternion: TrajectoryQuaternion }[] =
+    [];
+  if (kind === "descent") {
+    // from 450 m, looking almost straight down at the spot, down to the photo's own view (build_place.approach)
+    const n = 8;
+    const endPitch = Math.asin(forward.y);
+    for (let i = 0; i < n; i++) {
+      const s = i / (n - 1);
+      const alt = Math.exp(Math.log(450 + P.y) * (1 - s) + Math.log(P.y) * s);
+      const pitch =
+        THREE.MathUtils.degToRad(-70) +
+        (endPitch - THREE.MathUtils.degToRad(-70)) * s ** 1.4;
+      const back =
+        (alt - P.y) / Math.tan(Math.max(-pitch, THREE.MathUtils.degToRad(15)));
+      const C = P.clone().addScaledVector(heading, -back).setY(alt);
+      const dir = heading
+        .clone()
+        .multiplyScalar(Math.cos(pitch))
+        .setY(Math.sin(pitch));
+      views.push({
+        point: C.toArray(),
+        quaternion:
+          i === n - 1 ? photo.quaternion : look(C, C.clone().add(dir)),
+      });
+    }
+  } else if (kind === "circle") {
+    const S = new THREE.Vector3(...scene.focus).setY(P.y);
+    const radius = Math.min(8, Math.max(3, S.distanceTo(P) * 0.6));
+    const start = Math.atan2(P.x - S.x, P.z - S.z);
+    for (let k = 0; k < 8; k++) {
+      const a = start + (k / 8) * Math.PI * 2;
+      const C = new THREE.Vector3(
+        S.x + Math.sin(a) * radius,
+        P.y,
+        S.z + Math.cos(a) * radius,
+      );
+      views.push({ point: C.toArray(), quaternion: look(C, S) });
+    }
+  } else {
+    // a 3 m circle around the spot, starting and ending at the photo, looking the way you walk
+    const centre = P.clone().addScaledVector(heading, 3);
+    for (let k = 0; k <= 8; k++) {
+      const a = Math.atan2(-heading.x, -heading.z) + (k / 8) * Math.PI * 2;
+      const C = new THREE.Vector3(
+        centre.x + Math.sin(a) * 3,
+        P.y,
+        centre.z + Math.cos(a) * 3,
+      );
+      const along = new THREE.Vector3(Math.cos(a), 0, -Math.sin(a));
+      views.push({
+        point: C.toArray(),
+        quaternion:
+          k === 0 || k === 8 ? photo.quaternion : look(C, C.clone().add(along)),
+      });
+    }
+  }
+  return views;
 }
 
-export function CameraTrajectoryPage({
-  getToken,
-  canViewHistory,
-  beforePrepare,
-  beforeGenerate,
+function useSize(ref: RefObject<HTMLElement | null>) {
+  const [size, setSize] = useState({ width: 1, height: 1 });
+  useEffect(() => {
+    if (!ref.current) return;
+    const observer = new ResizeObserver(([entry]) =>
+      setSize({
+        width: entry!.contentRect.width,
+        height: entry!.contentRect.height,
+      }),
+    );
+    observer.observe(ref.current);
+    return () => observer.disconnect();
+  }, [ref]);
+  return size;
+}
+
+const pill =
+  "flex h-9 items-center gap-1 rounded-lg border border-black/10 bg-white/95 px-1 text-xs text-neutral-700 shadow-sm backdrop-blur";
+const pillButton =
+  "flex h-7 items-center gap-1.5 rounded-md px-2 font-medium transition hover:bg-black/5 hover:text-neutral-900 disabled:opacity-30 disabled:hover:bg-transparent";
+
+export function CameraWorkspace({
+  projectId,
+  scene,
+  mode,
+  saved,
+  hiddenFrames,
+  onToggleFrame,
+  takes,
+  onShowTakeDots,
+  onTakeStep,
+  onChange,
+  onRender,
+  placePanel,
 }: {
-  getToken: GetToken;
-  canViewHistory: boolean;
-  beforePrepare: () => boolean;
-  beforeGenerate: () => boolean;
+  projectId: string;
+  scene: Scene;
+  mode: Mode;
+  saved: Partial<EditorState>;
+  hiddenFrames: ReadonlySet<string>;
+  onToggleFrame: (name: string) => void;
+  takes: Take[];
+  onShowTakeDots: (tag: string | null) => void;
+  onTakeStep: (tag: string, step: "cloud" | "export") => void;
+  onChange: (state: EditorState) => void;
+  onRender: (targets: PinholeCamera[], what: string) => void;
+  placePanel: ReactNode;
 }) {
-  const fileInput = useRef<HTMLInputElement>(null);
-  const poseAbort = useRef<AbortController | null>(null);
-  const previewUrlRef = useRef<string | null>(null);
-  const pastedImageLoader = useRef<(file: File) => void>(() => undefined);
   const drawingPanelMinimizeButton = useRef<HTMLButtonElement | null>(null);
   const drawingPanelRestoreButton = useRef<HTMLButtonElement | null>(null);
   const directionPanelMinimizeButton = useRef<HTMLButtonElement | null>(null);
   const directionPanelRestoreButton = useRef<HTMLButtonElement | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [fileName, setFileName] = useState("");
-  const [poseBlob, setPoseBlob] = useState<Blob | null>(null);
-  const [pose, setPose] = useState<PosedView | null>(null);
-  const [poseElapsed, setPoseElapsed] = useState(0);
-  const [posing, setPosing] = useState(false);
-  const [segments, setSegments] = useState<TrajectorySegment[]>([]);
-  const [trajectorySmoothingVersion, setTrajectorySmoothingVersion] =
-    useState(0);
+  const viewport = useRef<HTMLDivElement>(null);
+  const viewportCamera = useRef<THREE.PerspectiveCamera | null>(null);
+  const viewportSize = useSize(viewport);
+  const [segments, setSegments] = useState<TrajectorySegment[]>(
+    saved.segments ?? [],
+  );
+  const [trajectorySmoothingVersion, setTrajectorySmoothingVersion] = useState(
+    saved.trajectorySmoothingVersion ?? 0,
+  );
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(
     null,
   );
@@ -401,714 +321,84 @@ export function CameraTrajectoryPage({
   const [drawingView, setDrawingView] = useState<TrajectoryDrawingView | null>(
     null,
   );
-  const [prompt, setPrompt] = useState("");
-  const [frameCount, setFrameCount] = useState(DEFAULT_FRAME_COUNT);
-  const [fps, setFps] = useState(DEFAULT_FPS);
-  const [seedCount, setSeedCount] = useState(DEFAULT_SEED_COUNT);
-  const [cfg, setCfg] = useState(DEFAULT_CFG);
-  const [freezeTime, setFreezeTime] = useState(DEFAULT_FREEZE_TIME);
+  const [frameCount, setFrameCount] = useState(
+    saved.frameCount ?? DEFAULT_FRAME_COUNT,
+  );
+  const [fps, setFps] = useState(saved.fps ?? DEFAULT_FPS);
   const [directionMode, setDirectionMode] = useState<CameraDirectionMode>(
-    DEFAULT_DIRECTION_MODE,
+    saved.directionMode ?? DEFAULT_DIRECTION_MODE,
   );
   const [directionTarget, setDirectionTarget] =
-    useState<TrajectoryPoint | null>(null);
+    useState<TrajectoryPoint | null>(saved.directionTarget ?? null);
   const [placingDirectionTarget, setPlacingDirectionTarget] = useState(false);
   const [pendingDirectionMode, setPendingDirectionMode] =
     useState<PointDirectionMode | null>(null);
   const [placingLookAtSegmentId, setPlacingLookAtSegmentId] = useState<
     string | null
   >(null);
-  const [closedLoop, setClosedLoop] = useState(false);
-  const [allowBelowFloor, setAllowBelowFloor] = useState(false);
-  const [targetFovDegrees, setTargetFovDegrees] = useState(50);
-  const [aspectRatio, setAspectRatio] =
-    useState<CameraTrajectoryAspectRatio>(DEFAULT_ASPECT_RATIO);
+  const [closedLoop, setClosedLoop] = useState(saved.closedLoop ?? false);
+  // The terrain is not flat: cameras may go below the photo spot's ground level (the dry run checks the terrain).
+  const [allowBelowFloor, setAllowBelowFloor] = useState(
+    saved.allowBelowFloor ?? true,
+  );
+  const [targetFovDegrees, setTargetFovDegrees] = useState(
+    saved.targetFovDegrees ?? Math.round(hfovToVfov(DEFAULT_HFOV_DEGREES)),
+  );
   const [previewing, setPreviewing] = useState(false);
   const [addingPivot, setAddingPivot] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
-  const [savingDraft, setSavingDraft] = useState(false);
-  const [restoringDraftId, setRestoringDraftId] = useState<string | null>(null);
-  const [optimisticQueue, setOptimisticQueue] = useState<
-    CameraTrajectoryHistoryItem[]
-  >([]);
-  const [removedGenerationIds, setRemovedGenerationIds] = useState<Set<string>>(
-    () => new Set(),
+  const [newPart, setNewPart] = useState(false);
+  const [padWidth, setPadWidth] = useState(150);
+  const [viewFrom, setViewFrom] = useState<ViewFrom | null>(null);
+  const [showImage, setShowImage] = useState(true);
+  const [takeTag, setTakeTag] = useState<string | null>(
+    takes.at(-1)?.tag ?? null,
   );
+  const [takeDots, setTakeDots] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const [historyOpen, setHistoryOpen] = useState(false);
-  const [homeOpen, setHomeOpen] = useState(false);
   const [drawingPanelOpen, setDrawingPanelOpen] = useState(true);
   const [directionPanelOpen, setDirectionPanelOpen] = useState(true);
   const [drawingPanelSizeIndex, setDrawingPanelSizeIndex] = useState(
     DEFAULT_DRAWING_PANEL_SIZE_INDEX,
   );
   const [error, setError] = useState<string | null>(null);
-  const targetFormat = TARGET_FORMATS[aspectRatio];
   const effectiveDirectionTarget = isPointDirectionMode(directionMode)
-    ? (directionTarget ?? pose?.centroidWorld)
-    : pose?.centroidWorld;
+    ? (directionTarget ?? scene.focus)
+    : scene.focus;
   const path = useMemo(() => trajectoryPathFromSegments(segments), [segments]);
-  const history = useQuery({
-    queryKey: ["camera-trajectory-history", getToken.storageScope],
-    queryFn: () => getCameraTrajectoryHistory(getToken),
-    enabled: historyOpen && canViewHistory,
-    refetchInterval: historyOpen && canViewHistory ? 10_000 : false,
-    refetchOnWindowFocus: false,
-  });
-  const drafts = useQuery({
-    queryKey: ["camera-trajectory-drafts", getToken.storageScope],
-    queryFn: () => getCameraTrajectoryDrafts(getToken),
-    enabled: historyOpen,
-    refetchOnWindowFocus: false,
-  });
-  const queueItems = useMemo(() => {
-    const merged = mergeHistoryItems(
-      optimisticQueue,
-      history.data?.items ?? [],
-    );
-    return [...removedGenerationIds].reduce(
-      (current, jobId) => removeHistoryJob(current, jobId),
-      merged,
-    );
-  }, [history.data?.items, optimisticQueue, removedGenerationIds]);
+  const take = takes.find((t) => t.tag === takeTag) ?? null;
 
-  useEffect(
-    () => () => {
-      poseAbort.current?.abort();
-      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
-    },
-    [],
+  const referenceView = useMemo<CameraView>(
+    () => ({
+      id: "reference",
+      position: scene.reference.extrinsics.position,
+      quaternion: scene.reference.extrinsics.quaternion,
+      fovRadians: verticalFov(scene.reference.intrinsics),
+    }),
+    [scene.reference],
   );
-
-  async function loadImage(
-    file: File,
-    restoredDraft?: CameraTrajectoryDraftDetails,
-    example = false,
-  ) {
-    if (!file.type.startsWith("image/")) {
-      setError("Choose an image file.");
-      return;
-    }
-
-    const isExample = example || restoredDraft?.depth_uri === EXAMPLE_DEPTH;
-    if (!isExample && !beforePrepare()) return;
-    if (!isExample) {
-      try {
-        sessionStorage.removeItem(EXAMPLE_HANDOFF);
-      } catch {}
-    }
-    setHomeOpen(false);
-
-    poseAbort.current?.abort();
-    const controller = new AbortController();
-    poseAbort.current = controller;
-
-    if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
-    const nextPreviewUrl = isExample
-      ? EXAMPLE_IMAGE
-      : URL.createObjectURL(file);
-    previewUrlRef.current = nextPreviewUrl;
-    setPreviewUrl(nextPreviewUrl);
-    setFileName(file.name);
-    setPoseBlob(null);
-    setPose(null);
-    setSegments([]);
-    setTrajectorySmoothingVersion(0);
-    setSelectedSegmentId(null);
-    setSelectedPivot(null);
-    setAddingPivot(false);
-    setPreviewing(false);
-    setDrawingView(null);
-    setPrompt(restoredDraft?.prompt ?? "");
-    setDirectionMode(restoredDirectionMode(restoredDraft?.direction_mode));
-    setDirectionTarget(null);
-    setPlacingDirectionTarget(false);
-    setPendingDirectionMode(null);
-    setPlacingLookAtSegmentId(null);
-    setClosedLoop(restoredDraft?.closed_loop ?? false);
-    setAllowBelowFloor(
-      restoredDraft?.allow_below_floor === true ||
-        (restoredDraft?.segments.some((segment) =>
-          segment.points.some((point) => point[1] < TRAJECTORY_FLOOR_Y),
-        ) ??
-          false),
-    );
-    setError(null);
-    setNotice(null);
-    setPoseElapsed(0);
-    setPosing(true);
-
-    try {
-      const blob = isExample
-        ? await fetch(EXAMPLE_IMAGE, { signal: controller.signal }).then(
-            (response) => {
-              if (!response.ok)
-                throw new Error("Could not load the example image.");
-              return response.blob();
-            },
-          )
-        : restoredDraft
-          ? file
-          : await fileToPoseBlob(file);
-      const nextPose = isExample
-        ? await loadExamplePose(controller.signal)
-        : restoredDraft
-          ? {
-              imageUrl: restoredDraft.reference_image_base64,
-              camera: restoredDraft.reference_camera,
-              points: await loadDepthPointCloud(
-                getToken,
-                restoredDraft.depth_uri,
-                restoredDraft.reference_camera.intrinsics,
-                { signal: controller.signal },
-              ),
-              depthUri: restoredDraft.depth_uri,
-              centroidWorld: restoredDraft.centroid_world,
-            }
-          : (
-              await posePointClouds(getToken, [blob], {
-                signal: controller.signal,
-                onTick: setPoseElapsed,
-              })
-            )[0];
-      if (!nextPose) throw new Error("No point cloud was returned");
-      if (controller.signal.aborted) return;
-
-      setPose(nextPose);
-      setPoseBlob(blob);
-      setDirectionTarget(
-        restoredDraft?.direction_target ??
-          (restoredDraft?.direction_mode === "inward" ||
-          restoredDraft?.direction_mode === "outward" ||
-          restoredDraft?.direction_mode === "look_at" ||
-          restoredDraft?.direction_mode === "look_away"
-            ? nextPose.centroidWorld
-            : null),
-      );
-      const restoredTargetFov =
-        restoredDraft?.target_fov_degrees ??
-        (restoredDraft?.target_cameras[0]
-          ? THREE.MathUtils.radToDeg(
-              verticalFov(restoredDraft.target_cameras[0].intrinsics),
-            )
-          : THREE.MathUtils.radToDeg(verticalFov(nextPose.camera.intrinsics)));
-      setTargetFovDegrees(
-        THREE.MathUtils.clamp(
-          Math.round(restoredTargetFov),
-          MIN_TARGET_FOV_DEGREES,
-          MAX_TARGET_FOV_DEGREES,
-        ),
-      );
-      if (isExample && !restoredDraft) {
-        const [x, y, z] = nextPose.camera.extrinsics.position;
-        const id = "example-path";
-        setSegments([
-          {
-            id,
-            points: [
-              [x, y, z],
-              [x + 0.35, y, z - 0.2],
-              [x + 0.75, y + 0.05, z - 0.45],
-            ],
-          },
-        ]);
-        setTrajectorySmoothingVersion(TRAJECTORY_SMOOTHING_VERSION);
-        setSelectedSegmentId(id);
-        setDirectionMode("look_at");
-        setDirectionTarget(nextPose.centroidWorld);
-        setPrompt(
-          "A smooth cinematic camera move around the cozy igloo. Preserve the scene and its lighting.",
-        );
-      }
-      if (restoredDraft) {
-        const restoredSmoothingVersion =
-          restoredDraft.trajectory_smoothing_version ?? 0;
-        const restoredTrajectory = materializeTrajectorySmoothing(
-          restoredDraft.segments,
-          restoredSmoothingVersion,
-        );
-        const segmentsWereSmoothed =
-          restoredSmoothingVersion >= TRAJECTORY_SMOOTHING_VERSION;
-        const restoredSegments = restoredTrajectory.segments;
-        setSegments(restoredSegments);
-        setTrajectorySmoothingVersion(restoredTrajectory.version);
-        const lastSegment = restoredSegments.at(-1);
-        setSelectedSegmentId(lastSegment?.id ?? null);
-        setSelectedPivot(
-          lastSegment
-            ? {
-                segmentId: lastSegment.id,
-                pointIndex: lastSegment.points.length - 1,
-                pivotNumber:
-                  trajectoryPathFromSegments(restoredSegments).length,
-              }
-            : null,
-        );
-        setFrameCount(DEFAULT_FRAME_COUNT);
-        setFps(DEFAULT_FPS);
-        setSeedCount(DEFAULT_SEED_COUNT);
-        setCfg(restoredDraft.cfg ?? DEFAULT_CFG);
-        setFreezeTime(restoredDraft.freeze_time ?? DEFAULT_FREEZE_TIME);
-        setAspectRatio(restoredDraft.aspect_ratio);
-        setNotice(
-          segmentsWereSmoothed
-            ? "Draft reopened."
-            : `Draft ${restoredDraft.draft_id} reopened with its hand-drawn path smoothed.`,
-        );
-      }
-    } catch (caught) {
-      if (controller.signal.aborted) return;
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      if (!controller.signal.aborted) setPosing(false);
-    }
-  }
-
-  function loadExample(draft?: CameraTrajectoryDraftDetails) {
-    return loadImage(
-      new File([], "Igloo example", { type: "image/jpeg" }),
-      draft,
-      true,
-    );
-  }
-
-  // Only this public sample crosses the sign-in remount. Private scenes remain
-  // account-scoped, and a new upload clears the sample handoff.
-  useEffect(() => {
-    let draft: CameraTrajectoryDraftDetails | undefined;
-    try {
-      const saved = JSON.parse(
-        sessionStorage.getItem(EXAMPLE_HANDOFF) || "null",
-      );
-      if (saved?.depth_uri === EXAMPLE_DEPTH && Array.isArray(saved.segments))
-        draft = saved;
-    } catch {}
-    if (
-      !draft &&
-      new URLSearchParams(location.search).get("example") !== "igloo"
-    )
-      return;
-    const timer = setTimeout(() => {
-      void loadExample(draft).then(() => {
-        if (canViewHistory) {
-          try {
-            sessionStorage.removeItem(EXAMPLE_HANDOFF);
-          } catch {}
-        }
-      });
-    }, 0);
-    return () => clearTimeout(timer);
-  }, []);
-
-  useEffect(() => {
-    if (canViewHistory || pose?.depthUri !== EXAMPLE_DEPTH || posing) return;
-    try {
-      sessionStorage.setItem(
-        EXAMPLE_HANDOFF,
-        JSON.stringify({
-          draft_id: "example",
-          saved_at: Date.now() / 1000,
-          file_name: "Igloo example",
-          depth_uri: EXAMPLE_DEPTH,
-          centroid_world: pose.centroidWorld,
-          reference_camera: pose.camera,
-          reference_image_base64: pose.imageUrl,
-          segments,
-          target_cameras: [],
-          prompt,
-          frame_count: frameCount,
-          fps,
-          seed_count: seedCount,
-          cfg,
-          freeze_time: freezeTime,
-          target_fov_degrees: targetFovDegrees,
-          aspect_ratio: aspectRatio,
-          direction_mode: directionMode,
-          direction_target: directionTarget,
-          closed_loop: closedLoop,
-          allow_below_floor: allowBelowFloor,
-          trajectory_smoothing_version: trajectorySmoothingVersion,
-        }),
-      );
-    } catch {
-      /* Storage can be unavailable; the editor still works. */
-    }
-  }, [
-    canViewHistory,
-    pose,
-    posing,
-    segments,
-    prompt,
-    frameCount,
-    fps,
-    seedCount,
-    cfg,
-    freezeTime,
-    targetFovDegrees,
-    aspectRatio,
-    directionMode,
-    directionTarget,
-    closedLoop,
-    allowBelowFloor,
-    trajectorySmoothingVersion,
-  ]);
-
-  pastedImageLoader.current = (file) => void loadImage(file);
-
-  useEffect(() => {
-    const pasteImage = (event: ClipboardEvent) => {
-      const clipboardImage = Array.from(event.clipboardData?.items ?? [])
-        .find((item) => item.kind === "file" && item.type.startsWith("image/"))
-        ?.getAsFile();
-      if (!clipboardImage) return;
-      event.preventDefault();
-      const file = clipboardImage.name
-        ? clipboardImage
-        : new File([clipboardImage], "pasted-image.png", {
-            type: clipboardImage.type,
-          });
-      pastedImageLoader.current(file);
-    };
-    window.addEventListener("paste", pasteImage);
-    return () => window.removeEventListener("paste", pasteImage);
-  }, []);
-
-  function chooseNewImage() {
-    fileInput.current?.click();
-  }
-
-  function goHome() {
-    setPreviewing(false);
-    setAddingPivot(false);
-    setHistoryOpen(false);
-    setHomeOpen(true);
-  }
-
-  async function generate() {
-    if (!beforeGenerate()) return;
-    if (!PORTRAIT_GENERATION_ENABLED && aspectRatio === "9:16") {
-      setError(
-        "9:16 generation is temporarily unavailable. Switch Aspect to 16:9.",
-      );
-      return;
-    }
-    if (
-      !pose ||
-      !poseBlob ||
-      !prompt.trim() ||
-      views.length < 2 ||
-      frameCount < requiredFrameCount ||
-      submitting ||
-      savingDraft
-    ) {
-      return;
-    }
-    setAddingPivot(false);
-    setPreviewing(false);
-    setSubmitting(true);
-    setError(null);
-    setNotice(null);
-    let savedDraftId: string | null = null;
-
-    try {
-      const generationSegments = materializeSmoothedTrajectory();
-      const generationViews = targetReferenceView
-        ? cameraViewsFromSegments(
-            generationSegments,
-            targetReferenceView,
-            allowBelowFloor,
-          )
-        : [];
-      if (
-        isPointDirectionMode(directionMode) &&
-        effectiveDirectionTarget &&
-        !cameraTargetIsClearOfPath(
-          generationViews,
-          effectiveDirectionTarget,
-          closedLoop,
-          Math.max(0.02, (trajectoryMap?.space.radius ?? 1) * 0.015),
-          undefined,
-          allowBelowFloor,
-        )
-      ) {
-        throw new Error(
-          "The camera path passes through the look target. Move the target away from the blue path before generating.",
-        );
-      }
-      for (const target of partLookAtTargets) {
-        if (
-          !partLookAtTargetIsClearOfPath(
-            generationViews,
-            target,
-            closedLoop,
-            Math.max(0.02, (trajectoryMap?.space.radius ?? 1) * 0.015),
-            allowBelowFloor,
-          )
-        ) {
-          throw new Error(
-            "A camera part passes through its look target. Move that target away from the blue path before generating.",
-          );
-        }
-      }
-      const targetCameras = buildTargetCameras(
-        generationViews,
-        frameCount,
-        targetFormat.width,
-        targetFormat.height,
-        {
-          directionMode,
-          directionTarget: effectiveDirectionTarget,
-          closedLoop,
-          allowBelowFloor,
-        },
-      );
-      const contextCamera: PinholeCamera = {
-        intrinsics: pose.camera.intrinsics,
-        extrinsics: {
-          ...pose.camera.extrinsics,
-          coordinateSystem: "rub",
-        },
-      };
-      const referenceImage = {
-        image_base64: await blobToDataUrl(poseBlob),
-        camera: contextCamera,
-      };
-      const submittedAt = Date.now() / 1000;
-      const submittedPrompt = prompt.trim();
-      const seeds = generationSeeds(seedCount);
-      const savedDraft = await saveCameraTrajectoryDraft(getToken, {
-        file_name: fileName || "reference-image.png",
-        depth_uri: pose.depthUri,
-        centroid_world: pose.centroidWorld,
-        reference_image: referenceImage,
-        segments: generationSegments,
-        target_cameras: targetCameras,
-        prompt: submittedPrompt,
-        frame_count: frameCount,
-        fps,
-        seed_count: seedCount,
-        cfg,
-        freeze_time: freezeTime,
-        target_fov_degrees: targetFovDegrees,
-        aspect_ratio: aspectRatio,
-        direction_mode: directionMode,
-        direction_target: isPointDirectionMode(directionMode)
-          ? (effectiveDirectionTarget ?? null)
-          : null,
-        closed_loop: closedLoop,
-        allow_below_floor: allowBelowFloor,
-        trajectory_smoothing_version: TRAJECTORY_SMOOTHING_VERSION,
-      });
-      savedDraftId = savedDraft.draft_id;
-      const results = await Promise.allSettled(
-        seeds.map((seed) =>
-          submitCameraTrajectory(
-            getToken,
-            referenceImage,
-            targetCameras,
-            savedDraft.draft_id,
-            submittedPrompt,
-            fps,
-            seed,
-          ),
-        ),
-      );
-      const queued: CameraTrajectoryHistoryVariant[] = results.flatMap(
-        (result, index) =>
-          result.status === "fulfilled"
-            ? [
-                {
-                  ...result.value,
-                  submitted_at: submittedAt + index / 1000,
-                  seed: seeds[index]!,
-                  prompt: submittedPrompt,
-                  target_frame_count: frameCount,
-                  fps,
-                  cfg,
-                  freeze_time: freezeTime,
-                  aspect_ratio: aspectRatio,
-                  video_uri: null,
-                  starred: false,
-                },
-              ]
-            : [],
-      );
-      if (queued.length > 0) {
-        setOptimisticQueue((current) => [
-          {
-            iteration_id: savedDraft.draft_id,
-            submitted_at: submittedAt,
-            prompt: submittedPrompt,
-            target_frame_count: frameCount,
-            fps,
-            aspect_ratio: aspectRatio,
-            variants: queued,
-          },
-          ...current,
-        ]);
-      }
-      if (queued.length === seeds.length) {
-        setNotice(
-          `Scene saved. ${seeds.length === 1 ? "Your video is" : `${seeds.length} videos are`} generating. Check Saved for the result.`,
-        );
-      } else if (queued.length > 0) {
-        setError(
-          `Scene ${savedDraftId} saved. Queued ${queued.length} of ${seeds.length} versions. Try Generate again.`,
-        );
-      } else {
-        const failure = results.find(
-          (result): result is PromiseRejectedResult =>
-            result.status === "rejected",
-        );
-        throw failure?.reason ?? new Error("Could not queue the generations");
-      }
-    } catch (caught) {
-      const message = caught instanceof Error ? caught.message : String(caught);
-      setError(
-        savedDraftId
-          ? `${message} Scene ${savedDraftId} is saved.`
-          : `Scene was not saved, so no videos were queued. ${message}`,
-      );
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  async function saveDraft() {
-    if (!pose || !poseBlob || !referenceView || savingDraft || submitting) {
-      return;
-    }
-    setSavingDraft(true);
-    setError(null);
-    setNotice(null);
-    try {
-      const savedSegments = materializeSmoothedTrajectory();
-      const savedViews = targetReferenceView
-        ? cameraViewsFromSegments(
-            savedSegments,
-            targetReferenceView,
-            allowBelowFloor,
-          )
-        : [];
-      const contextCamera: PinholeCamera = {
-        intrinsics: pose.camera.intrinsics,
-        extrinsics: {
-          ...pose.camera.extrinsics,
-          coordinateSystem: "rub",
-        },
-      };
-      const saved = await saveCameraTrajectoryDraft(getToken, {
-        file_name: fileName || "reference-image.png",
-        depth_uri: pose.depthUri,
-        centroid_world: pose.centroidWorld,
-        reference_image: {
-          image_base64: await blobToDataUrl(poseBlob),
-          camera: contextCamera,
-        },
-        segments: savedSegments,
-        target_cameras:
-          savedViews.length >= 2 && frameCount >= requiredFrameCount
-            ? buildTargetCameras(
-                savedViews,
-                frameCount,
-                targetFormat.width,
-                targetFormat.height,
-                {
-                  directionMode,
-                  directionTarget: effectiveDirectionTarget,
-                  closedLoop,
-                  allowBelowFloor,
-                },
-              )
-            : [],
-        prompt: prompt.trim(),
-        frame_count: frameCount,
-        fps,
-        seed_count: seedCount,
-        cfg,
-        freeze_time: freezeTime,
-        target_fov_degrees: targetFovDegrees,
-        aspect_ratio: aspectRatio,
-        direction_mode: directionMode,
-        direction_target: isPointDirectionMode(directionMode)
-          ? (effectiveDirectionTarget ?? null)
-          : null,
-        closed_loop: closedLoop,
-        allow_below_floor: allowBelowFloor,
-        trajectory_smoothing_version: TRAJECTORY_SMOOTHING_VERSION,
-      });
-      setNotice(`Draft ${saved.draft_id} saved without generation.`);
-      setHistoryOpen(true);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setSavingDraft(false);
-    }
-  }
-
-  async function openDraft(draftId: string) {
-    if (restoringDraftId) return;
-    setRestoringDraftId(draftId);
-    setError(null);
-    try {
-      const draft = await getCameraTrajectoryDraft(getToken, draftId);
-      const imageBlob = await fetch(draft.reference_image_base64).then(
-        (response) => response.blob(),
-      );
-      const file = new File([imageBlob], draft.file_name, {
-        type: imageBlob.type || "image/png",
-      });
-      setHistoryOpen(false);
-      await loadImage(file, draft);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setRestoringDraftId(null);
-    }
-  }
-
-  function removeOptimisticGeneration(jobId: string) {
-    setOptimisticQueue((current) => removeHistoryJob(current, jobId));
-    setRemovedGenerationIds((current) => new Set(current).add(jobId));
-  }
-
-  const referenceView = useMemo<CameraView | null>(
-    () =>
-      pose
-        ? {
-            id: "reference",
-            position: pose.camera.extrinsics.position,
-            quaternion: pose.camera.extrinsics.quaternion,
-            fovRadians: verticalFov(pose.camera.intrinsics),
-          }
-        : null,
-    [pose],
-  );
-  const targetReferenceView = useMemo<CameraView | null>(
-    () =>
-      referenceView
-        ? {
-            ...referenceView,
-            fovRadians: THREE.MathUtils.degToRad(targetFovDegrees),
-          }
-        : null,
+  const targetReferenceView = useMemo<CameraView>(
+    () => ({
+      ...referenceView,
+      fovRadians: THREE.MathUtils.degToRad(targetFovDegrees),
+    }),
     [referenceView, targetFovDegrees],
   );
-  const trajectoryMap = useMemo(
-    () => (pose ? buildTrajectoryMap(pose) : null),
-    [pose],
+  const trajectoryMap = useMemo(() => buildTrajectoryMap(scene), [scene]);
+  const padSpace = useMemo<TrajectorySpace>(
+    () => ({ center: trajectoryMap.space.center, radius: padWidth / 2 }),
+    [padWidth, trajectoryMap],
   );
   const views = useMemo(
     () =>
-      targetReferenceView
-        ? cameraViewsFromSegments(
-            segments,
-            targetReferenceView,
-            allowBelowFloor,
-          )
-        : [],
+      cameraViewsFromSegments(segments, targetReferenceView, allowBelowFloor),
     [allowBelowFloor, segments, targetReferenceView],
   );
+  const pathOptions = {
+    directionMode,
+    directionTarget: effectiveDirectionTarget,
+    closedLoop,
+    allowBelowFloor,
+  };
   const requiredFrameCount =
     views.length + (closedLoop && views.length >= 3 ? 1 : 0);
   const minimumFrameCount = Math.min(
@@ -1148,15 +438,7 @@ export function CameraTrajectoryPage({
     const viewIndex = selectedPivot.pivotNumber - 1;
     const view = views[viewIndex];
     return view
-      ? {
-          id: view.id,
-          ...sampleCameraPivot(views, viewIndex, {
-            directionMode,
-            directionTarget: effectiveDirectionTarget,
-            closedLoop,
-            allowBelowFloor,
-          }),
-        }
+      ? { id: view.id, ...sampleCameraPivot(views, viewIndex, pathOptions) }
       : null;
   }, [
     allowBelowFloor,
@@ -1166,8 +448,7 @@ export function CameraTrajectoryPage({
     selectedPivot,
     views,
   ]);
-  const ready = pose && referenceView && trajectoryMap;
-  const editSnapshot = useMemo(
+  const editSnapshot = useMemo<EditorState>(
     () => ({
       segments,
       trajectorySmoothingVersion,
@@ -1176,6 +457,8 @@ export function CameraTrajectoryPage({
       closedLoop,
       allowBelowFloor,
       targetFovDegrees,
+      frameCount,
+      fps,
     }),
     [
       segments,
@@ -1185,41 +468,34 @@ export function CameraTrajectoryPage({
       closedLoop,
       allowBelowFloor,
       targetFovDegrees,
+      frameCount,
+      fps,
     ],
   );
-  const edits = useEditHistory(
-    editSnapshot,
-    pose?.depthUri ?? null,
-    (state) => {
-      setSegments(state.segments);
-      setTrajectorySmoothingVersion(state.trajectorySmoothingVersion);
-      setDirectionMode(state.directionMode);
-      setDirectionTarget(state.directionTarget);
-      setClosedLoop(state.closedLoop);
-      setAllowBelowFloor(state.allowBelowFloor);
-      setTargetFovDegrees(state.targetFovDegrees);
-      setSelectedPivot(null);
-      setSelectedSegmentId(null);
-      setPreviewing(false);
-      setAddingPivot(false);
-      setPlacingDirectionTarget(false);
-      setPlacingLookAtSegmentId(null);
-      setPendingDirectionMode(null);
-      setError(null);
-      setNotice(null);
-    },
-  );
+  const edits = useEditHistory(editSnapshot, projectId, (state) => {
+    setSegments(state.segments);
+    setTrajectorySmoothingVersion(state.trajectorySmoothingVersion);
+    setDirectionMode(state.directionMode);
+    setDirectionTarget(state.directionTarget);
+    setClosedLoop(state.closedLoop);
+    setAllowBelowFloor(state.allowBelowFloor);
+    setTargetFovDegrees(state.targetFovDegrees);
+    setFrameCount(state.frameCount);
+    setFps(state.fps);
+    setSelectedPivot(null);
+    setSelectedSegmentId(null);
+    setPreviewing(false);
+    setAddingPivot(false);
+    setPlacingDirectionTarget(false);
+    setPlacingLookAtSegmentId(null);
+    setPendingDirectionMode(null);
+    setError(null);
+    setNotice(null);
+  });
+  useEffect(() => onChange(editSnapshot), [editSnapshot]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (
-        !ready ||
-        homeOpen ||
-        historyOpen ||
-        submitting ||
-        savingDraft ||
-        event.isComposing
-      )
-        return;
+      if (event.isComposing) return;
       if (
         event.target instanceof Element &&
         event.target.closest(
@@ -1252,6 +528,129 @@ export function CameraTrajectoryPage({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   });
+
+  // The cameras World Labs is asked for: one per camera point (Frame), or the path sampled into frames (Video).
+  function targetCameras(views: CameraView[]): PinholeCamera[] {
+    if (mode === "video")
+      return buildTargetCameras(views, frameCount, WIDTH, HEIGHT, pathOptions);
+    return views.map((_, index) => {
+      const view = sampleCameraPivot(views, index, pathOptions);
+      return {
+        intrinsics: createIntrinsicsFromFov(
+          THREE.MathUtils.radToDeg(view.fovRadians),
+          WIDTH,
+          HEIGHT,
+        ),
+        extrinsics: {
+          position: view.position,
+          quaternion: view.quaternion,
+          coordinateSystem: "rub",
+        },
+      };
+    });
+  }
+
+  function render() {
+    if (views.length < 1 || (mode === "video" && views.length < 2)) return;
+    const smoothed =
+      mode === "video" ? materializeSmoothedTrajectory() : segments;
+    onRender(
+      targetCameras(
+        cameraViewsFromSegments(smoothed, targetReferenceView, allowBelowFloor),
+      ),
+      mode === "video"
+        ? `a ${frameCount}-frame path (${(frameCount / fps).toFixed(1)} s at ${fps} fps)`
+        : `${views.length} camera ${views.length === 1 ? "point" : "points"}`,
+    );
+  }
+
+  // A camera where the viewport is looking from: appended to the last part, or the start of a new one.
+  function addCameras(
+    added: { point: TrajectoryPoint; quaternion: TrajectoryQuaternion }[],
+    startPart: boolean,
+  ) {
+    const materialized = materializeTrajectorySmoothing(
+      segments,
+      trajectorySmoothingVersion,
+    );
+    const current = materialized.segments;
+    const last = current.at(-1);
+    let next: TrajectorySegment[];
+    if (!last || startPart) {
+      const head = last
+        ? [
+            {
+              point: last.points.at(-1)!,
+              quaternion: last.quaternions?.at(-1) ?? null,
+            },
+          ]
+        : [];
+      const all = [...head, ...added];
+      next = [
+        ...current,
+        {
+          id: `part-${Date.now()}`,
+          points: all.map((a) => a.point),
+          quaternions: all.map((a) => a.quaternion),
+        },
+      ];
+    } else {
+      next = current.map((segment) =>
+        segment === last
+          ? {
+              ...segment,
+              points: [...segment.points, ...added.map((a) => a.point)],
+              quaternions: [
+                ...(segment.quaternions ?? segment.points.map(() => null)),
+                ...added.map((a) => a.quaternion),
+              ],
+            }
+          : segment,
+      );
+    }
+    setSegments(next);
+    setTrajectorySmoothingVersion(materialized.version);
+    const lastSegment = next.at(-1)!;
+    setSelectedSegmentId(lastSegment.id);
+    setSelectedPivot({
+      segmentId: lastSegment.id,
+      pointIndex: lastSegment.points.length - 1,
+      pivotNumber: trajectoryPathFromSegments(next).length,
+    });
+    setClosedLoop(false);
+    setPreviewing(false);
+    setError(null);
+  }
+
+  function addFrameHere() {
+    const camera = viewportCamera.current;
+    if (!camera) return;
+    addCameras(
+      [
+        {
+          point: camera.position.toArray() as TrajectoryPoint,
+          quaternion: camera.quaternion.toArray() as TrajectoryQuaternion,
+        },
+      ],
+      newPart,
+    );
+    setNewPart(false);
+    setNotice("Camera added where you are looking from.");
+  }
+
+  function addPreset(kind: PresetKind) {
+    addCameras(
+      presetPart(kind, scene, THREE.MathUtils.degToRad(targetFovDegrees)),
+      true,
+    );
+    setNotice(
+      kind === "descent"
+        ? "Added a descent from 450 m to the photo's view."
+        : kind === "circle"
+          ? "Added a circle at eye level around what the photo looks at."
+          : "Added a short walk from the photo spot.",
+    );
+  }
 
   function smoothPath() {
     setSegments(smoothTrajectorySegments(segments, closedLoop));
@@ -1329,7 +728,7 @@ export function CameraTrajectoryPage({
     const shaped = reshapeTrajectorySegments(
       materialized.segments,
       shape,
-      drawingView ?? cameraDrawingView(referenceView!.quaternion),
+      drawingView ?? cameraDrawingView(referenceView.quaternion),
       scopeSegmentId,
       closedLoop,
       allowBelowFloor,
@@ -1361,21 +760,21 @@ export function CameraTrajectoryPage({
     );
   }
 
-  function chooseDirectionMode(mode: CameraDirectionMode) {
-    if (isPointDirectionMode(mode) && !directionTarget) {
+  function chooseDirectionMode(nextMode: CameraDirectionMode) {
+    if (isPointDirectionMode(nextMode) && !directionTarget) {
       setPlacingLookAtSegmentId(null);
-      setPendingDirectionMode(mode);
+      setPendingDirectionMode(nextMode);
       setPlacingDirectionTarget(true);
       setPreviewing(false);
       setError(null);
       return;
     }
-    if (isPointDirectionMode(mode)) {
+    if (isPointDirectionMode(nextMode)) {
       setSegments((current) =>
         current.map((segment) => ({ ...segment, look_at_target: null })),
       );
     }
-    setDirectionMode(mode);
+    setDirectionMode(nextMode);
     setPlacingLookAtSegmentId(null);
     setPendingDirectionMode(null);
     setPlacingDirectionTarget(false);
@@ -1433,32 +832,32 @@ export function CameraTrajectoryPage({
   }
 
   function placeDirectionTarget(position: TrajectoryPoint) {
-    const targetViews =
-      placingLookAtSegmentId && targetReferenceView
-        ? cameraViewsFromSegments(
-            segments.map((segment) =>
-              segment.id === placingLookAtSegmentId
-                ? { ...segment, look_at_target: position }
-                : segment,
-            ),
-            targetReferenceView,
-            allowBelowFloor,
-          )
-        : views;
+    const clearance = Math.max(0.02, trajectoryMap.space.radius * 0.015);
+    const targetViews = placingLookAtSegmentId
+      ? cameraViewsFromSegments(
+          segments.map((segment) =>
+            segment.id === placingLookAtSegmentId
+              ? { ...segment, look_at_target: position }
+              : segment,
+          ),
+          targetReferenceView,
+          allowBelowFloor,
+        )
+      : views;
     if (
       !(placingLookAtSegmentId
         ? partLookAtTargetIsClearOfPath(
             targetViews,
             position,
             closedLoop,
-            Math.max(0.02, (trajectoryMap?.space.radius ?? 1) * 0.015),
+            clearance,
             allowBelowFloor,
           )
         : cameraTargetIsClearOfPath(
             targetViews,
             position,
             closedLoop,
-            Math.max(0.02, (trajectoryMap?.space.radius ?? 1) * 0.015),
+            clearance,
             undefined,
             allowBelowFloor,
           ))
@@ -1649,29 +1048,10 @@ export function CameraTrajectoryPage({
     setError(null);
   }
 
-  function updateFrameCount(nextFrameCount: number) {
-    setFrameCount(Math.max(nextFrameCount, minimumFrameCount));
-    setPreviewing(false);
-  }
-
-  function updateFps(nextFps: number) {
-    setFps(nextFps);
-    setPreviewing(false);
-  }
-
-  function updateTargetFov(nextTargetFovDegrees: number) {
-    setTargetFovDegrees(nextTargetFovDegrees);
-    setPreviewing(false);
-  }
-
-  function updateAspectRatio(nextAspectRatio: CameraTrajectoryAspectRatio) {
-    setAspectRatio(nextAspectRatio);
-    setPreviewing(false);
-  }
-
   function togglePathPreview() {
     if (views.length < 2) return;
     setAddingPivot(false);
+    setViewFrom(null);
     if (!previewing) materializeSmoothedTrajectory();
     setPreviewing((current) => !current);
     setError(null);
@@ -1697,513 +1077,733 @@ export function CameraTrajectoryPage({
     });
   }
 
-  return (
-    <div className="relative h-dvh min-h-dvh overflow-hidden bg-[#0b0c0f] font-sans text-[#f7f5ef]">
-      <input
-        ref={fileInput}
-        type="file"
-        accept="image/*"
-        className="hidden"
-        onChange={(event) => {
-          const file = event.target.files?.[0];
-          event.target.value = "";
-          if (file) void loadImage(file);
-        }}
-      />
+  function viewFromFrame(frame: Frame) {
+    setViewFrom({
+      label: frame.name,
+      image: frame.image,
+      view: {
+        id: frame.name,
+        position: frame.camera.extrinsics.position,
+        quaternion: frame.camera.extrinsics.quaternion,
+        fovRadians: verticalFov(frame.camera.intrinsics),
+      },
+    });
+  }
 
-      {!ready ? (
-        <UploadScreen
-          previewUrl={previewUrl}
-          posing={posing}
-          poseElapsed={poseElapsed}
-          error={error}
-          activeSceneName={null}
-          onResume={null}
-          onChoose={() => fileInput.current?.click()}
-          onDrop={(file) => void loadImage(file)}
-          onHistory={() => setHistoryOpen(true)}
-          onExample={() => void loadExample()}
-        />
-      ) : (
+  function viewFromPivot(index: number) {
+    const view = sampleCameraPivot(views, index, pathOptions);
+    setViewFrom({
+      label: `Camera ${index + 1}`,
+      view: { id: `pivot-${index}`, ...view },
+    });
+    const pivot = cameraPivots[index];
+    if (pivot)
+      selectPathPivot(pivot.segmentId, pivot.pointIndex, pivot.pivotNumber);
+  }
+
+  const box = frameBox(viewportSize.width, viewportSize.height);
+  const hfov = Math.round(vfovToHfov(targetFovDegrees));
+  const tile =
+    "group relative h-[5.25rem] w-[9.5rem] shrink-0 overflow-hidden rounded-lg border bg-neutral-100 text-left transition";
+
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-2 p-2">
+      <main
+        ref={viewport}
+        className="relative min-h-0 flex-1 overflow-hidden rounded-xl border border-black/10 bg-[#f6f6f4]"
+      >
         <div
-          className="flex h-full min-h-0 flex-col"
-          aria-hidden={homeOpen}
-          inert={homeOpen ? true : undefined}
+          className={
+            previewing
+              ? "absolute inset-0 grid place-items-center bg-neutral-900 p-4 sm:p-8"
+              : "absolute inset-0"
+          }
         >
-          {pose.depthUri === EXAMPLE_DEPTH && (
-            <div className="border-b border-white/10 bg-[#151b2c] px-4 py-2 text-xs text-white/70">
-              Example scene · Move the cameras, smooth the path, and press
-              Preview. No signup needed to explore.
-              {!canViewHistory &&
-                " Sign in and verify your phone only when you want to generate a video or upload your own image."}
+          <div
+            className={
+              previewing
+                ? "relative aspect-video w-full max-w-[min(72rem,130dvh)] overflow-hidden rounded-lg border border-white/15 bg-black shadow-2xl"
+                : "h-full w-full"
+            }
+          >
+            <CameraTrajectoryCanvas
+              scene={scene}
+              hiddenClouds={hiddenFrames}
+              viewFrom={viewFrom?.view ?? null}
+              onViewFromEnd={() => setViewFrom(null)}
+              viewportCamera={viewportCamera}
+              referenceView={referenceView}
+              views={views}
+              segments={segments}
+              selectedPivot={selectedPivot}
+              addingPivot={addingPivot}
+              previewing={previewing}
+              disabled={mode === "place"}
+              frameCount={frameCount}
+              previewSeconds={frameCount / fps}
+              frameWidth={WIDTH}
+              frameHeight={HEIGHT}
+              directionMode={directionMode}
+              directionTarget={effectiveDirectionTarget ?? null}
+              directionTargetCandidates={trajectoryMap.worldPoints}
+              placingDirectionTarget={placingDirectionTarget}
+              placingDirectionTargetMode={
+                pendingDirectionMode ??
+                (isPointDirectionMode(directionMode)
+                  ? directionMode
+                  : "look_at")
+              }
+              closedLoop={closedLoop}
+              allowBelowFloor={allowBelowFloor}
+              onPreviewDone={() => setPreviewing(false)}
+              onDrawingViewChange={setDrawingView}
+              onPointChange={movePathPoint}
+              onPointSelect={selectPathPivot}
+              onPivotAdd={addPathPivot}
+              onDirectionTargetChange={placeDirectionTarget}
+              onDirectionTargetCancel={() => {
+                setPlacingDirectionTarget(false);
+                setPendingDirectionMode(null);
+                setPlacingLookAtSegmentId(null);
+                setError(null);
+              }}
+              onDirectionTargetMiss={() =>
+                setError(
+                  "No reconstructed scene point there. Click on the visible point cloud.",
+                )
+              }
+            />
+            {previewing && (
+              <button
+                type="button"
+                onClick={togglePathPreview}
+                className="absolute right-3 top-3 flex h-9 items-center gap-2 rounded-md bg-white px-3 text-xs font-semibold text-neutral-900 shadow-lg transition hover:bg-white/90 active:translate-y-px"
+              >
+                <Pause className="h-3.5 w-3.5" />
+                Stop preview
+              </button>
+            )}
+          </div>
+        </div>
+
+        {viewFrom && !previewing && (
+          <div
+            className="pointer-events-none absolute rounded-sm border border-[#5b5fc7]/60"
+            style={{
+              ...box,
+              boxShadow: "0 0 0 100vmax rgba(30,30,28,0.28)",
+            }}
+          >
+            {viewFrom.image && showImage && (
+              <img
+                src={viewFrom.image}
+                alt={viewFrom.label}
+                className="h-full w-full object-cover"
+              />
+            )}
+          </div>
+        )}
+
+        {!previewing && (
+          <div className="pointer-events-none absolute inset-x-3 top-3 z-40 flex flex-wrap items-start justify-between gap-2 *:pointer-events-auto">
+            <div className="flex gap-2">
+              {mode === "place" ? null : (
+                <div className={pill}>
+                  <span className="pl-2 pr-1 text-neutral-400">Add part</span>
+                  <button
+                    type="button"
+                    className={pillButton}
+                    onClick={() => addPreset("descent")}
+                    title="8 cameras from 450 m down to the photo's view"
+                  >
+                    Descent
+                  </button>
+                  <button
+                    type="button"
+                    className={pillButton}
+                    onClick={() => addPreset("circle")}
+                    title="8 cameras at eye level around what the photo looks at"
+                  >
+                    Circle
+                  </button>
+                  <button
+                    type="button"
+                    className={pillButton}
+                    onClick={() => addPreset("walk")}
+                    title="9 cameras walking a 3 m circle from the photo spot and back"
+                  >
+                    Walk
+                  </button>
+                </div>
+              )}
             </div>
-          )}
-          <header className="relative z-40 grid shrink-0 grid-cols-[minmax(0,1fr)_auto] items-end gap-2 border-b border-white/10 bg-[#0f1014] px-3 py-2 md:grid-cols-[minmax(0,1fr)_auto] md:gap-3 md:px-4">
-            <div className="hidden md:block">
-              <h1 className="text-lg font-semibold tracking-[-0.025em]">
-                Plan the camera move
-              </h1>
-              <p className="mt-0.5 text-xs text-white/45">
-                {views.length >= 2
-                  ? `3D path → ${frameCount} video frames`
-                  : "Draw, rotate, and continue"}
-              </p>
+
+            <div>
+              {viewFrom ? (
+                <div className={pill}>
+                  <span className="pl-2 text-neutral-400">Viewing from</span>
+                  <span className="flex items-center gap-1.5 px-1 font-medium text-neutral-900">
+                    <ImageIcon className="h-3.5 w-3.5" />
+                    {viewFrom.label}
+                  </span>
+                  {viewFrom.image && (
+                    <button
+                      type="button"
+                      className={pillButton}
+                      title={
+                        showImage ? "Show the dots instead" : "Show the image"
+                      }
+                      onClick={() => setShowImage((v) => !v)}
+                    >
+                      {showImage ? (
+                        <EyeOff className="h-3.5 w-3.5" />
+                      ) : (
+                        <Eye className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className={pillButton}
+                    aria-label="Stop viewing from this camera"
+                    onClick={() => setViewFrom(null)}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ) : (
+                <label
+                  className={`${pill} pl-3`}
+                  title="Horizontal field of view of the cameras you add (1280 × 720)"
+                >
+                  <span className="text-neutral-400">FOV</span>
+                  <input
+                    type="number"
+                    min={Math.round(vfovToHfov(MIN_TARGET_FOV_DEGREES))}
+                    max={Math.round(vfovToHfov(MAX_TARGET_FOV_DEGREES))}
+                    value={hfov}
+                    onChange={(event) =>
+                      setTargetFovDegrees(
+                        hfovToVfov(
+                          Number(event.target.value) || DEFAULT_HFOV_DEGREES,
+                        ),
+                      )
+                    }
+                    className="h-7 w-14 rounded-md bg-transparent px-1 text-right font-medium tabular-nums text-neutral-900 outline-none focus:bg-black/5"
+                  />
+                  <span className="pr-2">°</span>
+                </label>
+              )}
             </div>
 
             <div className="flex gap-2">
-              <button
-                type="button"
-                aria-label="Undo"
-                title="Undo (⌘Z / Ctrl+Z)"
-                disabled={!edits.canUndo || submitting || savingDraft}
-                onClick={edits.undo}
-                className="grid h-11 w-11 place-items-center rounded-md border border-white/15 text-white/65 hover:bg-white/10 disabled:opacity-25"
+              <div className={pill}>
+                <button
+                  type="button"
+                  className={pillButton}
+                  aria-label="Undo"
+                  title="Undo (⌘Z)"
+                  disabled={!edits.canUndo}
+                  onClick={edits.undo}
+                >
+                  <Undo2 className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  className={pillButton}
+                  aria-label="Redo"
+                  title="Redo (⌘⇧Z)"
+                  disabled={!edits.canRedo}
+                  onClick={edits.redo}
+                >
+                  <Redo2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+              <div className={pill}>
+                <button
+                  type="button"
+                  className={pillButton}
+                  title="Look from the photo"
+                  onClick={() =>
+                    viewFromFrame(scene.frames.find((f) => f.name === "photo")!)
+                  }
+                >
+                  <ImageIcon className="h-3.5 w-3.5" />
+                  Photo
+                </button>
+                <button
+                  type="button"
+                  className={pillButton}
+                  title="Look straight down from 900 m"
+                  onClick={() =>
+                    setViewFrom({
+                      label: "Above, 900 m",
+                      view: {
+                        id: "above",
+                        position: [0, 900, 0],
+                        // pitched down 89°, north up (the orbit controls cannot look exactly straight down)
+                        quaternion: cameraQuaternionFromAim(0, -89),
+                        fovRadians: THREE.MathUtils.degToRad(45),
+                      },
+                    })
+                  }
+                >
+                  <MapIcon className="h-3.5 w-3.5" />
+                  Above
+                </button>
+              </div>
+              <div className={pill}>
+                <button
+                  type="button"
+                  className={pillButton}
+                  disabled={
+                    views.length < (mode === "video" ? 2 : 1) ||
+                    mode === "place"
+                  }
+                  title="The exact atlasGenerate request and its cost (sends nothing)"
+                  onClick={render}
+                >
+                  {"</>"} API
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {!previewing && mode === "place" && (
+          <div className="absolute left-3 top-16 z-30 max-h-[calc(100%-5rem)] w-[24rem] overflow-y-auto rounded-xl border border-black/10 bg-white/95 p-3 shadow-xl backdrop-blur">
+            {placePanel}
+          </div>
+        )}
+
+        {!previewing && mode === "video" && (
+          <div
+            id="trajectory-drawing-panel"
+            hidden={!drawingPanelOpen || placingDirectionTarget}
+            inert={placingDirectionTarget ? true : undefined}
+            className={`absolute left-3 top-16 z-30 max-h-[calc(100%-5rem)] max-w-[calc(100%-1.5rem)] overflow-y-auto overscroll-contain rounded-xl border border-black/10 bg-white/95 p-3 shadow-xl backdrop-blur ${DRAWING_PANEL_SIZES[drawingPanelSizeIndex]!.widthClass}`}
+          >
+            <div className="mb-2 flex items-center gap-2 border-b border-black/10 pb-2">
+              <label
+                className="flex flex-1 items-center gap-2 text-[11px] text-neutral-500"
+                title="How many metres the drawing pad spans"
               >
-                <Undo2 className="h-4 w-4" />
-              </button>
+                Pad width
+                <select
+                  value={padWidth}
+                  onChange={(event) => setPadWidth(Number(event.target.value))}
+                  className="h-7 rounded-md border border-black/10 bg-white px-1.5 text-[11px] font-medium text-neutral-800"
+                >
+                  {PAD_WIDTHS.map((w) => (
+                    <option key={w} value={w}>
+                      {w} m
+                    </option>
+                  ))}
+                </select>
+              </label>
               <button
+                ref={drawingPanelMinimizeButton}
                 type="button"
-                aria-label="Redo"
-                title="Redo (⌘⇧Z / Ctrl+Shift+Z)"
-                disabled={!edits.canRedo || submitting || savingDraft}
-                onClick={edits.redo}
-                className="grid h-11 w-11 place-items-center rounded-md border border-white/15 text-white/65 hover:bg-white/10 disabled:opacity-25"
+                aria-label="Minimize path panel"
+                title="Minimize path panel"
+                onClick={() => setDrawingPanelVisibility(false)}
+                className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-black/10 text-neutral-500 transition hover:bg-black/5 hover:text-neutral-900"
               >
-                <Redo2 className="h-4 w-4" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setHistoryOpen(true)}
-                className="flex h-11 items-center justify-center gap-2 rounded-md border border-white/15 px-3 text-sm text-white/65 transition hover:border-white/30 hover:bg-white/[0.06] hover:text-white disabled:opacity-30"
-              >
-                <HistoryIcon className="h-4 w-4" />
-                <span className="hidden lg:inline">Saved</span>
-                {queueItems.some((item) =>
-                  item.variants.some((variant) => variant.video_uri === null),
-                ) && (
-                  <span className="rounded bg-[#a9bcff]/15 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-[#c0cdff]">
-                    {
-                      queueItems.filter((item) =>
-                        item.variants.some(
-                          (variant) => variant.video_uri === null,
-                        ),
-                      ).length
-                    }
-                  </span>
-                )}
-              </button>
-              <button
-                type="button"
-                onClick={goHome}
-                aria-label="Home"
-                title="Home"
-                className="flex h-11 items-center justify-center gap-2 rounded-md border border-white/15 px-3 text-sm text-white/65 transition hover:border-white/30 hover:bg-white/[0.06] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] active:translate-y-px disabled:opacity-30"
-              >
-                <House className="h-4 w-4" />
-                <span className="hidden sm:inline">Home</span>
+                <PanelLeftClose className="h-4 w-4" />
               </button>
             </div>
-          </header>
+            <TrajectoryDrawPad
+              points={trajectoryMap.worldPoints}
+              referencePosition={referenceView.position}
+              segments={segments}
+              selectedSegmentId={selectedSegmentId}
+              path={path}
+              view={drawingView ?? cameraDrawingView(referenceView.quaternion)}
+              space={padSpace}
+              previewing={previewing}
+              addingPivot={addingPivot}
+              closedLoop={closedLoop}
+              allowBelowFloor={allowBelowFloor}
+              disabled={false}
+              panelSizeIndex={drawingPanelSizeIndex}
+              onChange={updateDrawnSegments}
+              onComplete={completeDrawnSegments}
+              onSelectPart={setSelectedSegmentId}
+              onDeletePart={deletePathPart}
+              onApplyShape={applyPathShape}
+              onSmooth={smoothPath}
+              onTogglePivot={() => {
+                setAddingPivot((current) => !current);
+                setPreviewing(false);
+                setError(null);
+              }}
+              onCloseLoop={closePathLoop}
+              onAllowBelowFloorChange={updateAllowBelowFloor}
+              onClear={clearPath}
+              onPlay={togglePathPreview}
+              onPanelSizeChange={setDrawingPanelSizeIndex}
+            />
+          </div>
+        )}
 
-          <main className="relative min-h-0 flex-1 overflow-hidden bg-[#111216]">
-            <div
-              className={
-                previewing
-                  ? "absolute inset-0 grid place-items-center bg-[#07080a] p-4 sm:p-8"
-                  : "absolute inset-0"
-              }
+        {!previewing &&
+          mode === "video" &&
+          !placingDirectionTarget &&
+          !drawingPanelOpen && (
+            <button
+              ref={drawingPanelRestoreButton}
+              type="button"
+              onClick={() => setDrawingPanelVisibility(true)}
+              className="absolute left-3 top-16 z-30 flex h-9 items-center gap-2 rounded-lg border border-black/10 bg-white/95 px-3 text-xs font-semibold text-neutral-700 shadow-sm hover:text-neutral-900"
             >
-              <div
-                className={
-                  previewing
-                    ? aspectRatio === "9:16"
-                      ? "relative h-full max-h-full max-w-full overflow-hidden rounded-lg border border-white/15 bg-black shadow-2xl"
-                      : "relative aspect-video w-full max-w-[min(72rem,130dvh)] overflow-hidden rounded-lg border border-white/15 bg-black shadow-2xl"
-                    : "h-full w-full"
-                }
-                style={
-                  previewing
-                    ? {
-                        aspectRatio: `${targetFormat.width} / ${targetFormat.height}`,
-                      }
-                    : undefined
-                }
-              >
-                <CameraTrajectoryCanvas
-                  key={pose.imageUrl}
-                  pose={pose}
-                  referenceView={referenceView}
-                  views={views}
-                  segments={segments}
-                  selectedPivot={selectedPivot}
-                  addingPivot={addingPivot}
-                  previewing={previewing}
-                  disabled={false}
-                  frameCount={frameCount}
-                  previewSeconds={frameCount / fps}
-                  frameWidth={targetFormat.width}
-                  frameHeight={targetFormat.height}
-                  directionMode={directionMode}
-                  directionTarget={effectiveDirectionTarget ?? null}
-                  directionTargetCandidates={trajectoryMap.worldPoints}
-                  placingDirectionTarget={placingDirectionTarget}
-                  placingDirectionTargetMode={
-                    pendingDirectionMode ??
-                    (isPointDirectionMode(directionMode)
-                      ? directionMode
-                      : "look_at")
-                  }
-                  closedLoop={closedLoop}
-                  allowBelowFloor={allowBelowFloor}
-                  onPreviewDone={() => setPreviewing(false)}
-                  onDrawingViewChange={setDrawingView}
-                  onPointChange={movePathPoint}
-                  onPointSelect={selectPathPivot}
-                  onPivotAdd={addPathPivot}
-                  onDirectionTargetChange={placeDirectionTarget}
-                  onDirectionTargetCancel={() => {
-                    setPlacingDirectionTarget(false);
-                    setPendingDirectionMode(null);
-                    setPlacingLookAtSegmentId(null);
-                    setError(null);
-                  }}
-                  onDirectionTargetMiss={() =>
-                    setError(
-                      "No reconstructed scene point there. Click on the visible point cloud.",
-                    )
-                  }
-                />
+              <PanelLeftOpen className="h-4 w-4" />
+              Path
+            </button>
+          )}
 
-                {previewing && (
+        {!previewing && mode !== "place" && views.length >= 1 && (
+          <CameraDirectionPanel
+            scene={scene}
+            pivots={cameraPivots}
+            selectedPivot={selectedPivot}
+            selectedView={selectedCameraView}
+            aspectRatio="16:9"
+            frameWidth={WIDTH}
+            frameHeight={HEIGHT}
+            directionMode={directionMode}
+            hasDirectionTarget={directionTarget !== null}
+            selectedPart={
+              selectedPart
+                ? {
+                    id: selectedPart.id,
+                    number: selectedPartIndex + 1,
+                    hasLookAtTarget: selectedPart.look_at_target != null,
+                  }
+                : null
+            }
+            disabled={addingPivot}
+            hidden={!directionPanelOpen || placingDirectionTarget}
+            minimizeButtonRef={directionPanelMinimizeButton}
+            onMinimize={() => setDirectionPanelVisibility(false)}
+            onSelect={(pivot) =>
+              selectPathPivot(
+                pivot.segmentId,
+                pivot.pointIndex,
+                pivot.pivotNumber,
+              )
+            }
+            onAngleChange={(pivot, quaternion) => {
+              setPathPivotCameraAngle(
+                pivot.segmentId,
+                pivot.pointIndex,
+                quaternion,
+              );
+            }}
+            onDirectionModeChange={chooseDirectionMode}
+            onChooseDirectionTarget={() => {
+              setPlacingLookAtSegmentId(null);
+              if (isPointDirectionMode(directionMode)) {
+                setPendingDirectionMode(directionMode);
+              }
+              setPlacingDirectionTarget(true);
+              setPreviewing(false);
+              setError(null);
+            }}
+            onChoosePartDirectionTarget={choosePartDirectionTarget}
+            onRemovePartDirectionTarget={removePartLookAtTarget}
+            onLimitDirectionTargetToPart={limitLookAtTargetToPart}
+            onDelete={deletePathPivot}
+          />
+        )}
+
+        {!previewing &&
+          mode !== "place" &&
+          !placingDirectionTarget &&
+          views.length >= 1 &&
+          !directionPanelOpen && (
+            <button
+              ref={directionPanelRestoreButton}
+              type="button"
+              onClick={() => setDirectionPanelVisibility(true)}
+              className="absolute right-3 top-16 z-30 flex h-9 items-center gap-2 rounded-lg border border-black/10 bg-white/95 px-3 text-xs font-semibold text-neutral-700 shadow-sm hover:text-neutral-900"
+            >
+              Aim
+              <PanelRightOpen className="h-4 w-4" />
+            </button>
+          )}
+
+        {!previewing && (error || notice) && (
+          <div className="absolute inset-x-3 bottom-3 z-20 mx-auto max-w-xl">
+            {error && (
+              <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-center text-xs text-red-700">
+                {error}
+              </div>
+            )}
+            {notice && !error && (
+              <div
+                role="status"
+                className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-center text-xs text-emerald-800"
+              >
+                {notice}
+              </div>
+            )}
+          </div>
+        )}
+      </main>
+
+      <section className="flex shrink-0 flex-wrap gap-2">
+        <div className="min-w-[20rem] flex-1 rounded-xl border border-black/10 bg-white p-2.5">
+          <div className="mb-2 flex items-center gap-2 whitespace-nowrap px-1 text-xs">
+            <span className="font-semibold text-neutral-900">
+              Spatial Context
+            </span>
+            <span className="text-neutral-400">
+              {scene.frames.length - hiddenFrames.size} of {scene.frames.length}
+            </span>
+            {mode !== "place" && views.length > 0 && (
+              <>
+                <span className="ml-4 font-semibold text-neutral-900">
+                  Cameras
+                </span>
+                <span className="text-neutral-400">{views.length}</span>
+              </>
+            )}
+            {takes.length > 0 && (
+              <label className="ml-auto flex items-center gap-1.5 text-neutral-500">
+                Results
+                <select
+                  value={takeTag ?? ""}
+                  onChange={(event) => {
+                    setTakeTag(event.target.value || null);
+                    setTakeDots(false);
+                    onShowTakeDots(null);
+                  }}
+                  className="h-7 rounded-md border border-black/10 bg-white px-1.5 font-medium text-neutral-800"
+                >
+                  <option value="">none</option>
+                  {takes.map((t) => (
+                    <option key={t.tag} value={t.tag}>
+                      {t.tag} · {t.frames.length}
+                    </option>
+                  ))}
+                </select>
+                {take && (
+                  <label
+                    className="flex items-center gap-1"
+                    title="Its frames with the depth World Labs returned, as dots in the 3D view"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={takeDots}
+                      onChange={(event) => {
+                        setTakeDots(event.target.checked);
+                        onShowTakeDots(event.target.checked ? take.tag : null);
+                      }}
+                    />
+                    as dots
+                  </label>
+                )}
+                {take?.cloud && (
+                  <a
+                    href={take.cloud}
+                    download
+                    className="text-[#4a4eb3] underline"
+                  >
+                    cloud.ply
+                  </a>
+                )}
+                {take && (
                   <>
-                    <div className="pointer-events-none absolute left-3 top-3 rounded-md border border-white/15 bg-[#0b0c0f]/85 px-3 py-2 text-xs font-medium text-white/75 backdrop-blur">
-                      Camera preview · {aspectRatio}
-                    </div>
                     <button
                       type="button"
-                      onClick={togglePathPreview}
-                      className="absolute right-3 top-3 flex h-9 items-center gap-2 rounded-md bg-white px-3 text-xs font-semibold text-[#101114] shadow-lg transition hover:bg-white/90 active:translate-y-px"
+                      title="Fuse the take and the photo into one dot cloud (place_cloud.py)"
+                      onClick={() => onTakeStep(take.tag, "cloud")}
+                      className="h-7 rounded-md border border-black/10 px-2 font-medium text-neutral-700 hover:bg-black/5"
                     >
-                      <Pause className="h-3.5 w-3.5" />
-                      Stop preview
+                      {take.cloud ? "Fuse again" : "Fuse .ply"}
+                    </button>
+                    <button
+                      type="button"
+                      title="Bundle the request, its files and results into export/ (export_request.py)"
+                      onClick={() => onTakeStep(take.tag, "export")}
+                      className="h-7 rounded-md border border-black/10 px-2 font-medium text-neutral-700 hover:bg-black/5"
+                    >
+                      Export
                     </button>
                   </>
                 )}
-              </div>
-            </div>
-
-            {!previewing && (
-              <div
-                id="trajectory-drawing-panel"
-                hidden={!drawingPanelOpen || placingDirectionTarget}
-                inert={placingDirectionTarget ? true : undefined}
-                data-camera-drawing-panel-size={
-                  DRAWING_PANEL_SIZES[drawingPanelSizeIndex]!.label
-                }
-                className={`absolute left-3 top-3 z-30 max-h-[calc(100%-11rem)] max-w-[calc(100%-1.5rem)] overflow-y-auto overscroll-contain rounded-xl border border-white/15 bg-[#0b0c0f]/94 p-3 shadow-2xl transition-[width] duration-200 backdrop-blur-xl xl:max-h-[calc(100%-7rem)] ${DRAWING_PANEL_SIZES[drawingPanelSizeIndex]!.widthClass}`}
-              >
-                <div className="mb-2 flex items-center gap-2.5 border-b border-white/10 pb-2">
+              </label>
+            )}
+          </div>
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            {scene.frames.map((frame) => {
+              const hidden = hiddenFrames.has(frame.name);
+              return (
+                <div
+                  key={frame.name}
+                  className={`${tile} ${viewFrom?.label === frame.name ? "border-[#5b5fc7] ring-2 ring-[#5b5fc7]/30" : "border-black/10 hover:border-black/30"} ${hidden ? "opacity-40" : ""}`}
+                >
                   <button
                     type="button"
-                    onClick={chooseNewImage}
-                    className="group w-16 shrink-0 overflow-hidden rounded bg-black disabled:opacity-30"
+                    className="h-full w-full"
+                    onClick={() => viewFromFrame(frame)}
+                    title={`Look from ${frame.name}`}
                   >
                     <img
-                      src={previewUrl ?? pose.imageUrl}
-                      alt="Change reference image"
-                      className="aspect-video w-full object-cover transition group-hover:opacity-80"
+                      src={frame.image}
+                      alt={frame.name}
+                      className="h-full w-full object-cover"
                     />
                   </button>
-                  <div className="min-w-0 flex-1">
-                    <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#f4b860]">
-                      Reference image
-                    </p>
-                    <p className="mt-0.5 text-[11px] text-white/55">
-                      Not frame 1
-                    </p>
-                    <p
-                      className="mt-0.5 truncate text-[10px] text-white/30"
-                      title={fileName}
-                    >
-                      {fileName}
-                    </p>
-                  </div>
-                  <button
-                    ref={drawingPanelMinimizeButton}
-                    type="button"
-                    data-overlay-toggle="path"
-                    aria-label="Minimize path panel"
-                    aria-controls="trajectory-drawing-panel"
-                    aria-expanded="true"
-                    title="Minimize path panel"
-                    onClick={() => setDrawingPanelVisibility(false)}
-                    className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-white/10 text-white/45 transition hover:border-white/25 hover:bg-white/[0.07] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] active:translate-y-px"
-                  >
-                    <PanelLeftClose className="h-4 w-4" />
-                  </button>
-                </div>
-
-                <TrajectoryDrawPad
-                  points={trajectoryMap.worldPoints}
-                  referencePosition={referenceView.position}
-                  segments={segments}
-                  selectedSegmentId={selectedSegmentId}
-                  path={path}
-                  view={
-                    drawingView ?? cameraDrawingView(referenceView.quaternion)
-                  }
-                  space={trajectoryMap.space}
-                  previewing={previewing}
-                  addingPivot={addingPivot}
-                  closedLoop={closedLoop}
-                  allowBelowFloor={allowBelowFloor}
-                  disabled={false}
-                  panelSizeIndex={drawingPanelSizeIndex}
-                  onChange={updateDrawnSegments}
-                  onComplete={completeDrawnSegments}
-                  onSelectPart={setSelectedSegmentId}
-                  onDeletePart={deletePathPart}
-                  onApplyShape={applyPathShape}
-                  onSmooth={smoothPath}
-                  onTogglePivot={() => {
-                    setAddingPivot((current) => !current);
-                    setPreviewing(false);
-                    setError(null);
-                  }}
-                  onCloseLoop={closePathLoop}
-                  onAllowBelowFloorChange={updateAllowBelowFloor}
-                  onClear={clearPath}
-                  onPlay={togglePathPreview}
-                  onPanelSizeChange={setDrawingPanelSizeIndex}
-                />
-              </div>
-            )}
-
-            {!previewing && !placingDirectionTarget && !drawingPanelOpen && (
-              <button
-                ref={drawingPanelRestoreButton}
-                type="button"
-                data-overlay-toggle="path"
-                aria-label="Restore path panel"
-                aria-controls="trajectory-drawing-panel"
-                aria-expanded="false"
-                onClick={() => setDrawingPanelVisibility(true)}
-                className="absolute left-3 top-3 z-30 flex h-10 items-center gap-2 rounded-lg border border-white/15 bg-[#0b0c0f]/94 px-3 text-xs font-semibold text-white/70 shadow-xl backdrop-blur-xl transition hover:border-white/30 hover:bg-[#17181d] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] active:translate-y-px"
-              >
-                <PanelLeftOpen className="h-4 w-4" />
-                Path
-              </button>
-            )}
-
-            {!previewing && views.length >= 1 && (
-              <CameraDirectionPanel
-                pose={pose}
-                pivots={cameraPivots}
-                selectedPivot={selectedPivot}
-                selectedView={selectedCameraView}
-                aspectRatio={aspectRatio}
-                frameWidth={targetFormat.width}
-                frameHeight={targetFormat.height}
-                directionMode={directionMode}
-                hasDirectionTarget={directionTarget !== null}
-                selectedPart={
-                  selectedPart
-                    ? {
-                        id: selectedPart.id,
-                        number: selectedPartIndex + 1,
-                        hasLookAtTarget: selectedPart.look_at_target != null,
-                      }
-                    : null
-                }
-                disabled={addingPivot}
-                hidden={!directionPanelOpen || placingDirectionTarget}
-                minimizeButtonRef={directionPanelMinimizeButton}
-                onMinimize={() => setDirectionPanelVisibility(false)}
-                onSelect={(pivot) =>
-                  selectPathPivot(
-                    pivot.segmentId,
-                    pivot.pointIndex,
-                    pivot.pivotNumber,
-                  )
-                }
-                onAngleChange={(pivot, quaternion) => {
-                  setPathPivotCameraAngle(
-                    pivot.segmentId,
-                    pivot.pointIndex,
-                    quaternion,
-                  );
-                }}
-                onDirectionModeChange={chooseDirectionMode}
-                onChooseDirectionTarget={() => {
-                  setPlacingLookAtSegmentId(null);
-                  if (isPointDirectionMode(directionMode)) {
-                    setPendingDirectionMode(directionMode);
-                  }
-                  setPlacingDirectionTarget(true);
-                  setPreviewing(false);
-                  setError(null);
-                }}
-                onChoosePartDirectionTarget={choosePartDirectionTarget}
-                onRemovePartDirectionTarget={removePartLookAtTarget}
-                onLimitDirectionTargetToPart={limitLookAtTargetToPart}
-                onDelete={deletePathPivot}
-              />
-            )}
-
-            {!previewing &&
-              !placingDirectionTarget &&
-              views.length >= 1 &&
-              !directionPanelOpen && (
-                <button
-                  ref={directionPanelRestoreButton}
-                  type="button"
-                  data-overlay-toggle="direction"
-                  aria-label="Restore camera direction panel"
-                  aria-controls="camera-direction-panel"
-                  aria-expanded="false"
-                  onClick={() => setDirectionPanelVisibility(true)}
-                  className="absolute right-3 top-3 z-30 flex h-10 items-center gap-2 rounded-lg border border-white/15 bg-[#0b0c0f]/94 px-3 text-xs font-semibold text-white/70 shadow-xl backdrop-blur-xl transition hover:border-white/30 hover:bg-[#17181d] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] active:translate-y-px"
-                >
-                  Aim
-                  <PanelRightOpen className="h-4 w-4" />
-                </button>
-              )}
-
-            {!previewing && (
-              <div className="absolute inset-x-3 bottom-3 z-20 mx-auto max-w-6xl">
-                {error && (
-                  <div className="mb-2 rounded-md border border-red-400/30 bg-red-950/90 px-3 py-2 text-center text-xs text-red-100 backdrop-blur">
-                    {error}
-                  </div>
-                )}
-                {notice && (
-                  <div
-                    role="status"
-                    aria-live="polite"
-                    className="mb-2 rounded-md border border-emerald-300/25 bg-emerald-950/90 px-3 py-2 text-center text-xs text-emerald-100 backdrop-blur"
-                  >
-                    {notice}
-                  </div>
-                )}
-
-                <div
-                  aria-hidden={placingDirectionTarget ? true : undefined}
-                  inert={placingDirectionTarget ? true : undefined}
-                  className={`flex flex-wrap items-end gap-2 rounded-xl border border-white/15 bg-[#0b0c0f]/92 p-2.5 pl-4 shadow-2xl backdrop-blur-xl sm:gap-3 xl:flex-nowrap ${placingDirectionTarget ? "pointer-events-none invisible" : ""}`}
-                >
-                  <OutputNumberInput
-                    label="FOV°"
-                    value={targetFovDegrees}
-                    min={MIN_TARGET_FOV_DEGREES}
-                    max={MAX_TARGET_FOV_DEGREES}
-                    disabled={false}
-                    onChange={updateTargetFov}
-                  />
-
+                  <span className="pointer-events-none absolute bottom-1 left-1 rounded bg-white/90 px-1.5 py-0.5 text-[10px] font-medium text-neutral-800">
+                    {frame.name}
+                  </span>
                   <button
                     type="button"
-                    disabled={savingDraft || submitting}
-                    onClick={() => void saveDraft()}
-                    className="flex h-11 min-w-28 items-center justify-center gap-2 rounded-md border border-white/20 px-3 text-sm font-semibold text-white/75 transition hover:border-white/35 hover:bg-white/[0.07] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60 active:translate-y-px disabled:cursor-wait disabled:opacity-35 sm:px-4"
-                  >
-                    {savingDraft ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Save className="h-4 w-4" />
-                    )}
-                    {savingDraft ? "Saving…" : "Save draft"}
-                  </button>
-
-                  <label className="block min-w-48 flex-1">
-                    <span className="mb-1 block text-[11px] font-medium text-white/55">
-                      What should happen?{" "}
-                      <span className="text-[#a9bcff]"></span>
-                    </span>
-                    <input
-                      aria-label="Video prompt"
-                      value={prompt}
-                      onChange={(event) => setPrompt(event.target.value)}
-                      maxLength={1000}
-                      placeholder="Example: Slowly orbit left as the person walks forward"
-                      className="h-11 w-full rounded-md border border-white/15 bg-white/[0.06] px-3 text-sm text-white outline-none transition placeholder:text-white/30 hover:border-white/25 focus:border-[#a9bcff] focus:ring-2 focus:ring-[#8ca8ff]/20 disabled:opacity-40"
-                    />
-                  </label>
-
-                  <button
-                    type="button"
-                    disabled={
-                      !prompt.trim() ||
-                      views.length < 2 ||
-                      frameCount < requiredFrameCount ||
-                      (!PORTRAIT_GENERATION_ENABLED &&
-                        aspectRatio === "9:16") ||
-                      submitting ||
-                      savingDraft
+                    onClick={() => onToggleFrame(frame.name)}
+                    title={
+                      hidden
+                        ? "Leave out of the request: click to use it"
+                        : "Used in the request: click to leave it out"
                     }
-                    onClick={() => void generate()}
-                    className="flex h-11 min-w-28 items-center justify-center gap-2 rounded-md bg-[#a9bcff] px-3 text-sm font-semibold text-[#10131c] transition hover:bg-[#c0cdff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70 active:translate-y-px disabled:cursor-not-allowed disabled:opacity-35 sm:min-w-36 sm:px-4"
+                    className="absolute right-1 top-1 grid h-6 w-6 place-items-center rounded bg-white/90 text-neutral-700 opacity-0 transition group-hover:opacity-100"
                   >
-                    {submitting ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
+                    {hidden ? (
+                      <EyeOff className="h-3.5 w-3.5" />
                     ) : (
-                      <Sparkles className="h-4 w-4" />
+                      <Eye className="h-3.5 w-3.5" />
                     )}
-                    {views.length < 2
-                      ? "Draw a path"
-                      : !PORTRAIT_GENERATION_ENABLED && aspectRatio === "9:16"
-                        ? "9:16 unavailable"
-                        : requiredFrameCount > MAX_FRAME_COUNT
-                          ? "Remove path points"
-                          : frameCount < requiredFrameCount
-                            ? `Use ${requiredFrameCount}+ frames`
-                            : !prompt.trim()
-                              ? "Add a prompt"
-                              : submitting
-                                ? `Adding ${seedCount}…`
-                                : `Queue ${seedCount} ${seedCount === 1 ? "video" : "videos"}`}
                   </button>
                 </div>
+              );
+            })}
+            {mode !== "place" &&
+              views.map((view, index) => (
+                <button
+                  key={view.id}
+                  type="button"
+                  onClick={() => viewFromPivot(index)}
+                  title={`Look from camera ${index + 1}`}
+                  className={`${tile} grid place-items-center ${viewFrom?.label === `Camera ${index + 1}` ? "border-[#5b5fc7] ring-2 ring-[#5b5fc7]/30" : "border-dashed border-black/15 hover:border-black/30"}`}
+                >
+                  <span className="text-lg font-semibold tabular-nums text-neutral-700">
+                    {index + 1}
+                  </span>
+                  <span className="absolute bottom-1 left-1.5 text-[10px] tabular-nums text-neutral-500">
+                    {Math.round(view.position[1])} m up
+                  </span>
+                </button>
+              ))}
+            {take?.frames.map((frame, index) => (
+              <button
+                key={frame.image}
+                type="button"
+                onClick={() =>
+                  setViewFrom({
+                    label: `${take.tag} · ${index + 1}`,
+                    image: frame.image,
+                    view: {
+                      id: frame.image,
+                      position: frame.camera.extrinsics.position,
+                      quaternion: frame.camera.extrinsics.quaternion,
+                      fovRadians: verticalFov(frame.camera.intrinsics),
+                    },
+                  })
+                }
+                title={frame.label}
+                className={`${tile} ${viewFrom?.label === `${take.tag} · ${index + 1}` ? "border-[#5b5fc7] ring-2 ring-[#5b5fc7]/30" : "border-black/10 hover:border-black/30"}`}
+              >
+                <img
+                  src={frame.image}
+                  alt={frame.label}
+                  className="h-full w-full object-cover"
+                />
+                <span className="pointer-events-none absolute bottom-1 left-1 rounded bg-white/90 px-1.5 py-0.5 text-[10px] font-medium text-neutral-800">
+                  {index + 1}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {mode !== "place" && (
+          <div className="flex w-[17rem] shrink-0 flex-col gap-2 rounded-xl border border-black/10 bg-white p-2.5">
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={addFrameHere}
+                className="flex h-11 flex-1 items-center justify-center gap-2 rounded-lg bg-[#5b5fc7] text-sm font-semibold text-white shadow-sm transition hover:bg-[#4a4eb3] active:translate-y-px"
+                title="Add a camera where the viewport is looking from"
+              >
+                <Plus className="h-4 w-4" />
+                Add frame
+              </button>
+              <button
+                type="button"
+                aria-pressed={newPart}
+                onClick={() => setNewPart((v) => !v)}
+                title="The next frame starts a new part of the path"
+                className={`h-11 rounded-lg border px-2.5 text-[11px] font-semibold transition ${newPart ? "border-[#5b5fc7] bg-[#5b5fc7]/10 text-[#4a4eb3]" : "border-black/10 text-neutral-600 hover:bg-black/5"}`}
+              >
+                New part
+              </button>
+            </div>
+            {mode === "video" ? (
+              <div className="flex items-end gap-2">
+                <OutputNumberInput
+                  label="Frames"
+                  value={frameCount}
+                  min={minimumFrameCount}
+                  max={MAX_FRAME_COUNT}
+                  disabled={false}
+                  onChange={(v) => {
+                    setFrameCount(Math.max(v, minimumFrameCount));
+                    setPreviewing(false);
+                  }}
+                />
+                <OutputNumberInput
+                  label="FPS"
+                  value={fps}
+                  min={1}
+                  max={60}
+                  disabled={false}
+                  onChange={(v) => {
+                    setFps(v);
+                    setPreviewing(false);
+                  }}
+                />
+                <button
+                  type="button"
+                  disabled={views.length < 2}
+                  onClick={togglePathPreview}
+                  className="flex h-11 items-center gap-1.5 rounded-lg border border-black/10 px-2.5 text-xs font-semibold text-neutral-700 hover:bg-black/5 disabled:opacity-30"
+                  title="Fly the path through the dots"
+                >
+                  <Play className="h-3.5 w-3.5" />
+                  {(frameCount / fps).toFixed(1)} s
+                </button>
               </div>
-            )}
-          </main>
-        </div>
-      )}
-
-      {ready && homeOpen && (
-        <div className="absolute inset-0 z-[60] bg-[#0b0c0f]">
-          <UploadScreen
-            previewUrl={previewUrl}
-            posing={false}
-            poseElapsed={poseElapsed}
-            error={error}
-            activeSceneName={fileName}
-            onResume={() => setHomeOpen(false)}
-            onChoose={() => fileInput.current?.click()}
-            onDrop={(file) => void loadImage(file)}
-            onHistory={() => setHistoryOpen(true)}
-            onExample={() => void loadExample()}
-          />
-        </div>
-      )}
-
-      <HistoryPanel
-        getToken={getToken}
-        open={historyOpen}
-        history={history}
-        items={queueItems}
-        drafts={drafts}
-        draftItems={drafts.data?.items ?? []}
-        restoringDraftId={restoringDraftId}
-        onOpenDraft={openDraft}
-        onGenerationRemoved={removeOptimisticGeneration}
-        onClose={() => setHistoryOpen(false)}
-      />
+            ) : null}
+            <button
+              type="button"
+              disabled={views.length < (mode === "video" ? 2 : 1)}
+              onClick={render}
+              className="flex h-10 items-center justify-center gap-2 rounded-lg border border-black/10 text-sm font-medium text-neutral-800 transition hover:bg-black/5 disabled:opacity-35"
+            >
+              <Sparkles className="h-4 w-4" />
+              {mode === "video"
+                ? `Render video · ${frameCount} frames`
+                : `Render ${views.length || ""} ${views.length === 1 ? "frame" : "frames"}`}
+            </button>
+          </div>
+        )}
+      </section>
     </div>
   );
 }
 
 function CameraDirectionPanel({
-  pose,
+  scene,
   pivots,
   selectedPivot,
   selectedView,
@@ -2226,7 +1826,7 @@ function CameraDirectionPanel({
   onLimitDirectionTargetToPart,
   onDelete,
 }: {
-  pose: PosedView;
+  scene: Scene;
   pivots: readonly TrajectoryPivot[];
   selectedPivot: SelectedPivot | null;
   selectedView: CameraView | null;
@@ -2361,12 +1961,14 @@ function CameraDirectionPanel({
       id="camera-direction-panel"
       hidden={hidden}
       aria-label="Camera direction"
-      className="absolute right-3 top-3 z-20 max-h-[calc(100%-7rem)] w-[calc(50%-1.125rem)] max-w-[22rem] overflow-y-auto rounded-xl border border-white/15 bg-[#0b0c0f]/94 p-3 shadow-2xl backdrop-blur-xl"
+      className="absolute right-3 top-16 z-30 max-h-[calc(100%-5rem)] w-[calc(50%-1.125rem)] max-w-[22rem] overflow-y-auto rounded-xl border border-black/10 bg-white/95 p-3 shadow-2xl backdrop-blur-xl"
     >
-      <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-2.5">
+      <div className="flex items-start justify-between gap-3 border-b border-black/10 pb-2.5">
         <div>
-          <h2 className="text-sm font-semibold text-white">Camera direction</h2>
-          <p className="mt-1 text-[11px] leading-4 text-white/45">
+          <h2 className="text-sm font-semibold text-neutral-900">
+            Camera direction
+          </h2>
+          <p className="mt-1 text-[11px] leading-4 text-neutral-500">
             Select a camera to move, aim, or delete it.
           </p>
         </div>
@@ -2379,7 +1981,7 @@ function CameraDirectionPanel({
           aria-expanded="true"
           title="Minimize camera direction panel"
           onClick={onMinimize}
-          className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-white/10 text-white/45 transition hover:border-white/25 hover:bg-white/[0.07] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] active:translate-y-px"
+          className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-black/10 text-neutral-500 transition hover:border-black/25 hover:bg-black/5 hover:text-neutral-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5b5fc7] active:translate-y-px"
         >
           <PanelRightClose className="h-4 w-4" />
         </button>
@@ -2402,15 +2004,15 @@ function CameraDirectionPanel({
                 aria-label={`Select camera at point ${pivot.pivotNumber}`}
                 aria-pressed={selected}
                 onClick={() => onSelect(pivot)}
-                className={`grid h-8 w-8 shrink-0 place-items-center rounded-md border text-xs font-semibold tabular-nums transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] active:translate-y-px ${
+                className={`grid h-8 w-8 shrink-0 place-items-center rounded-md border text-xs font-semibold tabular-nums transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5b5fc7] active:translate-y-px ${
                   selected
                     ? partTargeted
-                      ? "border-[#f4b860] bg-[#f4b860] text-[#10131c]"
-                      : "border-white bg-white text-[#10131c]"
+                      ? "border-[#f4b860] bg-[#f4b860] text-neutral-900"
+                      : "border-neutral-900 bg-neutral-900 text-neutral-900"
                     : partTargeted
-                      ? "border-[#f4b860]/55 bg-[#f4b860]/10 text-[#ffd18d] hover:border-[#f4b860] hover:bg-[#f4b860]/20"
-                      : "border-white/15 bg-white/[0.06] text-white/60 hover:border-white/30 hover:text-white"
-                } ${!pointDirectionMode && pivot.hasCameraAngle ? "ring-1 ring-[#a9bcff]/80 ring-offset-1 ring-offset-[#0b0c0f]" : ""}`}
+                      ? "border-[#f4b860]/55 bg-[#f4b860]/10 text-amber-700 hover:border-[#f4b860] hover:bg-[#f4b860]/20"
+                      : "border-black/10 bg-black/[0.04] text-neutral-600 hover:border-black/25 hover:text-neutral-900"
+                } ${!pointDirectionMode && pivot.hasCameraAngle ? "ring-1 ring-[#5b5fc7]/80 ring-offset-1 ring-offset-white" : ""}`}
               >
                 {pivot.pivotNumber}
               </button>
@@ -2425,7 +2027,7 @@ function CameraDirectionPanel({
             disabled={disabled}
             onClick={() => onDelete(selectedPivot)}
             title={`Delete camera ${selectedPivot.pivotNumber} (Delete / Backspace)`}
-            className="flex h-8 shrink-0 items-center justify-center gap-1 rounded-md border border-red-400/25 bg-red-500/[0.06] px-2 text-[11px] font-medium text-red-200/70 transition hover:border-red-400/45 hover:bg-red-500/10 hover:text-red-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300 disabled:cursor-not-allowed disabled:opacity-30"
+            className="flex h-8 shrink-0 items-center justify-center gap-1 rounded-md border border-red-400/25 bg-red-500/[0.06] px-2 text-[11px] font-medium text-red-600 transition hover:border-red-400/45 hover:bg-red-500/10 hover:text-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300 disabled:cursor-not-allowed disabled:opacity-30"
           >
             <Trash2 className="h-3.5 w-3.5" />
             Delete {selectedPivot.pivotNumber}
@@ -2462,7 +2064,7 @@ function CameraDirectionPanel({
                 ? undefined
                 : (event) => finishAimDrag(event, false)
             }
-            className={`relative mt-2.5 select-none overflow-hidden rounded-lg border border-white/15 bg-[#090a0d] ${selectedUsesPointTarget ? "touch-auto" : "touch-none"} ${aspectRatio === "9:16" ? "mx-auto w-[58%]" : "w-full"} ${disabled ? "cursor-not-allowed opacity-40" : selectedUsesPointTarget ? "cursor-default" : "cursor-grab active:cursor-grabbing"}`}
+            className={`relative mt-2.5 select-none overflow-hidden rounded-lg border border-black/10 bg-[#ececea] ${selectedUsesPointTarget ? "touch-auto" : "touch-none"} ${aspectRatio === "9:16" ? "mx-auto w-[58%]" : "w-full"} ${disabled ? "cursor-not-allowed opacity-40" : selectedUsesPointTarget ? "cursor-default" : "cursor-grab active:cursor-grabbing"}`}
             style={{ aspectRatio: `${frameWidth} / ${frameHeight}` }}
           >
             <div
@@ -2471,22 +2073,22 @@ function CameraDirectionPanel({
               className="pointer-events-none absolute inset-0"
             >
               <CameraPointCloudView
-                pose={pose}
+                scene={scene}
                 view={{
                   ...selectedView,
                   quaternion: displayedQuaternion!,
                 }}
               />
             </div>
-            <div className="pointer-events-none absolute left-2 top-2 rounded border border-white/15 bg-[#0b0c0f]/80 px-2 py-1 text-[10px] font-medium text-white/65 backdrop-blur">
+            <div className="pointer-events-none absolute left-2 top-2 rounded border border-black/10 bg-white/85 px-2 py-1 text-[10px] font-medium text-neutral-700 backdrop-blur">
               Point {selectedPivot.pivotNumber} · dense camera view
             </div>
             <div className="pointer-events-none absolute left-1/2 top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2">
-              <span className="absolute left-1/2 top-0 h-full w-px -translate-x-1/2 bg-white/55" />
-              <span className="absolute left-0 top-1/2 h-px w-full -translate-y-1/2 bg-white/55" />
+              <span className="absolute left-1/2 top-0 h-full w-px -translate-x-1/2 bg-neutral-900/50" />
+              <span className="absolute left-0 top-1/2 h-px w-full -translate-y-1/2 bg-neutral-900/50" />
             </div>
           </div>
-          <p className="mt-1.5 text-[10px] leading-4 text-white/35">
+          <p className="mt-1.5 text-[10px] leading-4 text-neutral-400">
             {selectedUsesPointTarget
               ? selectedPivotUsesPartTarget && !pointDirectionMode
                 ? "Preview follows this part's target. Other parts keep their own behavior."
@@ -2497,9 +2099,9 @@ function CameraDirectionPanel({
           {!selectedUsesPointTarget && (
             <div className="mt-3 space-y-2.5">
               <div>
-                <p className="flex items-center justify-between text-[11px] font-medium text-white/60">
+                <p className="flex items-center justify-between text-[11px] font-medium text-neutral-600">
                   <span>Yaw · left / right</span>
-                  <span className="font-mono text-[10px] tabular-nums text-[#c0cdff]">
+                  <span className="font-mono text-[10px] tabular-nums text-[#4a4eb3]">
                     {Math.round(aim.yaw)}°
                   </span>
                 </p>
@@ -2517,9 +2119,9 @@ function CameraDirectionPanel({
                 </div>
               </div>
               <div>
-                <p className="flex items-center justify-between text-[11px] font-medium text-white/60">
+                <p className="flex items-center justify-between text-[11px] font-medium text-neutral-600">
                   <span>Pitch · down / up</span>
-                  <span className="font-mono text-[10px] tabular-nums text-[#c0cdff]">
+                  <span className="font-mono text-[10px] tabular-nums text-[#4a4eb3]">
                     {Math.round(aim.pitch)}°
                   </span>
                 </p>
@@ -2541,14 +2143,14 @@ function CameraDirectionPanel({
         </>
       ) : (
         <div
-          className={`mt-3 grid place-items-center rounded-lg border border-dashed border-white/15 bg-white/[0.025] px-8 text-center text-xs leading-5 text-white/40 ${aspectRatio === "9:16" ? "mx-auto w-[58%]" : "w-full"}`}
+          className={`mt-3 grid place-items-center rounded-lg border border-dashed border-black/10 bg-black/[0.02] px-8 text-center text-xs leading-5 text-neutral-400 ${aspectRatio === "9:16" ? "mx-auto w-[58%]" : "w-full"}`}
           style={{ aspectRatio: `${frameWidth} / ${frameHeight}` }}
         >
           Choose a point above to aim its camera.
         </div>
       )}
       <div className="mt-3">
-        <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/40">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-neutral-400">
           Camera behavior
         </p>
         <div
@@ -2566,10 +2168,10 @@ function CameraDirectionPanel({
                 aria-pressed={selected}
                 title={preset.title}
                 onClick={() => onDirectionModeChange(preset.mode)}
-                className={`h-8 rounded-md border px-2 text-[11px] font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] active:translate-y-px ${
+                className={`h-8 rounded-md border px-2 text-[11px] font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5b5fc7] active:translate-y-px ${
                   selected
-                    ? "border-[#a9bcff] bg-[#a9bcff] text-[#10131c]"
-                    : "border-white/15 bg-white/[0.04] text-white/60 hover:border-white/30 hover:text-white"
+                    ? "border-[#5b5fc7] bg-[#5b5fc7] text-neutral-900"
+                    : "border-black/10 bg-black/[0.03] text-neutral-600 hover:border-black/25 hover:text-neutral-900"
                 }`}
               >
                 {preset.label}
@@ -2578,7 +2180,7 @@ function CameraDirectionPanel({
           })}
         </div>
         {directionMode !== "manual" && !isPointDirectionMode(directionMode) && (
-          <p className="mt-1.5 text-[10px] leading-4 text-white/35">
+          <p className="mt-1.5 text-[10px] leading-4 text-neutral-400">
             Adjusted cameras override this preset; the rest stay automatic.
           </p>
         )}
@@ -2587,10 +2189,10 @@ function CameraDirectionPanel({
       {pointDirectionMode && (
         <div className="mt-3 flex flex-col items-stretch gap-2 rounded-lg border border-[#f4b860]/25 bg-[#f4b860]/[0.06] p-2.5">
           <div className="min-w-0">
-            <p className="text-[11px] font-semibold text-[#ffd18d]">
+            <p className="text-[11px] font-semibold text-amber-700">
               {hasDirectionTarget ? "Target set in scene" : "Choose a target"}
             </p>
-            <p className="mt-0.5 text-[10px] leading-4 text-white/40">
+            <p className="mt-0.5 text-[10px] leading-4 text-neutral-400">
               Every camera points{" "}
               {directionMode === "look_at" ? "at" : "away from"} this spot with
               a level horizon.
@@ -2600,7 +2202,7 @@ function CameraDirectionPanel({
             type="button"
             data-change-direction-target="true"
             onClick={onChooseDirectionTarget}
-            className="h-8 shrink-0 rounded-md border border-[#f4b860]/35 bg-[#f4b860]/10 px-2.5 text-[11px] font-semibold text-[#ffd18d] transition hover:bg-[#f4b860]/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#f4b860] active:translate-y-px"
+            className="h-8 shrink-0 rounded-md border border-[#f4b860]/35 bg-[#f4b860]/10 px-2.5 text-[11px] font-semibold text-amber-700 transition hover:bg-[#f4b860]/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#f4b860] active:translate-y-px"
           >
             {hasDirectionTarget ? "Change point" : "Pick point in 3D"}
           </button>
@@ -2610,14 +2212,14 @@ function CameraDirectionPanel({
       {selectedPart && (
         <div
           data-part-look-at={selectedPart.hasLookAtTarget ? "set" : "unset"}
-          className="mt-3 rounded-lg border border-white/15 bg-white/[0.035] p-2.5"
+          className="mt-3 rounded-lg border border-black/10 bg-black/[0.03] p-2.5"
         >
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <p className="text-[11px] font-semibold text-white/70">
+              <p className="text-[11px] font-semibold text-neutral-700">
                 Selected Part {selectedPart.number}
               </p>
-              <p className="mt-0.5 text-[10px] leading-4 text-white/40">
+              <p className="mt-0.5 text-[10px] leading-4 text-neutral-400">
                 {selectedPart.hasLookAtTarget
                   ? "This part looks at its own scene point."
                   : pointDirectionMode
@@ -2635,7 +2237,7 @@ function CameraDirectionPanel({
                 type="button"
                 data-change-part-look-at={selectedPart.number}
                 onClick={() => onChoosePartDirectionTarget(selectedPart.id)}
-                className="h-8 rounded-md border border-[#f4b860]/35 bg-[#f4b860]/10 px-2 text-[11px] font-semibold text-[#ffd18d] transition hover:bg-[#f4b860]/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#f4b860] active:translate-y-px"
+                className="h-8 rounded-md border border-[#f4b860]/35 bg-[#f4b860]/10 px-2 text-[11px] font-semibold text-amber-700 transition hover:bg-[#f4b860]/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#f4b860] active:translate-y-px"
               >
                 Change point
               </button>
@@ -2643,7 +2245,7 @@ function CameraDirectionPanel({
                 type="button"
                 data-remove-part-look-at={selectedPart.number}
                 onClick={() => onRemovePartDirectionTarget(selectedPart.id)}
-                className="h-8 rounded-md border border-white/15 px-2 text-[11px] font-semibold text-white/55 transition hover:border-white/30 hover:bg-white/[0.06] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] active:translate-y-px"
+                className="h-8 rounded-md border border-black/10 px-2 text-[11px] font-semibold text-neutral-600 transition hover:border-black/25 hover:bg-black/5 hover:text-neutral-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5b5fc7] active:translate-y-px"
               >
                 Remove
               </button>
@@ -2653,7 +2255,7 @@ function CameraDirectionPanel({
               type="button"
               data-limit-look-at-to-part={selectedPart.number}
               onClick={() => onLimitDirectionTargetToPart(selectedPart.id)}
-              className="mt-2 h-8 w-full rounded-md border border-[#f4b860]/35 bg-[#f4b860]/10 px-2 text-[11px] font-semibold text-[#ffd18d] transition hover:bg-[#f4b860]/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#f4b860] active:translate-y-px"
+              className="mt-2 h-8 w-full rounded-md border border-[#f4b860]/35 bg-[#f4b860]/10 px-2 text-[11px] font-semibold text-amber-700 transition hover:bg-[#f4b860]/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#f4b860] active:translate-y-px"
             >
               Look here only for Part {selectedPart.number}
             </button>
@@ -2662,7 +2264,7 @@ function CameraDirectionPanel({
               type="button"
               data-add-part-look-at={selectedPart.number}
               onClick={() => onChoosePartDirectionTarget(selectedPart.id)}
-              className="mt-2 h-8 w-full rounded-md border border-[#f4b860]/35 bg-[#f4b860]/10 px-2 text-[11px] font-semibold text-[#ffd18d] transition hover:bg-[#f4b860]/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#f4b860] active:translate-y-px"
+              className="mt-2 h-8 w-full rounded-md border border-[#f4b860]/35 bg-[#f4b860]/10 px-2 text-[11px] font-semibold text-amber-700 transition hover:bg-[#f4b860]/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#f4b860] active:translate-y-px"
             >
               Look at a point for Part {selectedPart.number}
             </button>
@@ -2687,7 +2289,7 @@ function CameraAimButton({
       type="button"
       disabled={disabled}
       onClick={onClick}
-      className="h-8 rounded-md border border-white/15 bg-white/[0.05] px-2 text-[11px] font-medium text-white/60 transition hover:border-white/30 hover:bg-white/[0.08] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] active:translate-y-px disabled:cursor-not-allowed disabled:opacity-30"
+      className="h-8 rounded-md border border-black/10 bg-black/[0.03] px-2 text-[11px] font-medium text-neutral-600 transition hover:border-black/25 hover:bg-black/5 hover:text-neutral-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5b5fc7] active:translate-y-px disabled:cursor-not-allowed disabled:opacity-30"
     >
       {label}
     </button>
@@ -2699,27 +2301,18 @@ type TrajectoryMap = {
   worldPoints: TrajectoryPoint[];
 };
 
-function buildTrajectoryMap(pose: PosedView): TrajectoryMap {
-  const center = new THREE.Vector3(...pose.centroidWorld);
-  const transform = new THREE.Matrix4().compose(
-    new THREE.Vector3(...pose.camera.extrinsics.position),
-    new THREE.Quaternion(...pose.camera.extrinsics.quaternion),
-    new THREE.Vector3(1, 1, 1),
-  );
+function buildTrajectoryMap(scene: Scene): TrajectoryMap {
+  const center = new THREE.Vector3(...scene.focus);
   const worldPoints: TrajectoryPoint[] = [];
-  const pointCount = pose.points.shape[0] * pose.points.shape[1];
-  const step = Math.max(1, Math.floor(pointCount / 1200));
-  const world = new THREE.Vector3();
-
-  for (let index = 0; index < pointCount; index += step) {
-    const offset = index * 3;
-    const x = pose.points.positions[offset];
-    const y = pose.points.positions[offset + 1];
-    const z = pose.points.positions[offset + 2];
-    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z))
-      continue;
-    world.set(x, y, z).applyMatrix4(transform);
-    worldPoints.push(world.toArray());
+  for (const cloud of scene.clouds) {
+    const count = cloud.positions.length / 3;
+    const step = Math.max(1, Math.floor(count / 600));
+    for (let index = 0; index < count; index += step) {
+      const point = Array.from(
+        cloud.positions.subarray(index * 3, index * 3 + 3),
+      ) as TrajectoryPoint;
+      if (point.every(Number.isFinite)) worldPoints.push(point);
+    }
   }
 
   const extents = worldPoints
@@ -2729,7 +2322,7 @@ function buildTrajectoryMap(pose: PosedView): TrajectoryMap {
 
   return {
     space: {
-      center: pose.centroidWorld,
+      center: scene.focus,
       radius: Math.max(1, sceneExtent * 1.35),
     },
     worldPoints,
@@ -3011,11 +2604,13 @@ function TrajectoryDrawPad({
     <section>
       <div className="mb-2 flex items-center justify-between gap-2">
         <div className="flex items-center gap-1.5">
-          <Rotate3D className="h-3.5 w-3.5 text-white/45" />
-          <h2 className="text-sm font-semibold text-white">Draw new path</h2>
+          <Rotate3D className="h-3.5 w-3.5 text-neutral-500" />
+          <h2 className="text-sm font-semibold text-neutral-900">
+            Draw new path
+          </h2>
         </div>
         <div
-          className="flex h-7 items-center overflow-hidden rounded-md border border-white/15 bg-black/25"
+          className="flex h-7 items-center overflow-hidden rounded-md border border-black/10 bg-black/[0.03]"
           aria-label="Drawing panel size"
         >
           <button
@@ -3024,7 +2619,7 @@ function TrajectoryDrawPad({
             onClick={() => onPanelSizeChange(Math.max(0, panelSizeIndex - 1))}
             aria-label="Make drawing panel smaller"
             title="Make drawing panel smaller"
-            className="grid h-full w-7 place-items-center text-white/55 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-white/60 disabled:opacity-25"
+            className="grid h-full w-7 place-items-center text-neutral-600 transition hover:bg-black/5 hover:text-neutral-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-black/60 disabled:opacity-25"
           >
             <ZoomOut className="h-3.5 w-3.5" />
           </button>
@@ -3033,7 +2628,7 @@ function TrajectoryDrawPad({
             onClick={() => onPanelSizeChange(DEFAULT_DRAWING_PANEL_SIZE_INDEX)}
             aria-label={`Reset drawing panel size from ${panelSize.label} to Medium`}
             title="Reset drawing panel size"
-            className="h-full min-w-14 border-x border-white/10 px-1.5 text-[10px] font-semibold text-white/75 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-white/60"
+            className="h-full min-w-14 border-x border-black/10 px-1.5 text-[10px] font-semibold text-neutral-800 transition hover:bg-black/5 hover:text-neutral-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-black/60"
           >
             {panelSize.label}
           </button>
@@ -3047,14 +2642,14 @@ function TrajectoryDrawPad({
             }
             aria-label="Make drawing panel larger"
             title="Make drawing panel larger"
-            className="grid h-full w-7 place-items-center text-white/55 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-white/60 disabled:opacity-25"
+            className="grid h-full w-7 place-items-center text-neutral-600 transition hover:bg-black/5 hover:text-neutral-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-black/60 disabled:opacity-25"
           >
             <ZoomIn className="h-3.5 w-3.5" />
           </button>
         </div>
       </div>
 
-      <p className="mb-2 text-[10px] leading-4 text-white/45">
+      <p className="mb-2 text-[10px] leading-4 text-neutral-500">
         {addingPivot
           ? "Click the blue path in the main 3D view."
           : "Larger panel = finer moves. Every point-to-point section gets equal video time."}
@@ -3067,24 +2662,25 @@ function TrajectoryDrawPad({
         data-allow-below-floor={allowBelowFloor}
         disabled={disabled}
         onClick={() => onAllowBelowFloorChange(!allowBelowFloor)}
-        className={`mb-2 flex w-full items-center justify-between gap-3 rounded-lg border px-3 py-2 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] disabled:opacity-30 ${
+        className={`mb-2 flex w-full items-center justify-between gap-3 rounded-lg border px-3 py-2 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5b5fc7] disabled:opacity-30 ${
           allowBelowFloor
             ? "border-[#66c7e8]/45 bg-[#66c7e8]/10"
-            : "border-white/10 bg-white/[0.025] hover:border-white/20 hover:bg-white/[0.05]"
+            : "border-black/10 bg-black/[0.02] hover:border-black/20 hover:bg-black/5"
         }`}
       >
         <span>
-          <span className="block text-[11px] font-semibold text-white/80">
-            Allow below floor
+          <span className="block text-[11px] font-semibold text-neutral-800">
+            Allow below y = 0
           </span>
-          <span className="mt-0.5 block text-[9px] leading-3.5 text-white/40">
-            Turn on for underwater or underground shots.
+          <span className="mt-0.5 block text-[9px] leading-3.5 text-neutral-400">
+            y = 0 is the ground at the photo spot. The terrain is checked in the
+            request review.
           </span>
         </span>
         <span
           aria-hidden="true"
           className={`relative h-5 w-9 shrink-0 rounded-full transition ${
-            allowBelowFloor ? "bg-[#66c7e8]" : "bg-white/15"
+            allowBelowFloor ? "bg-[#66c7e8]" : "bg-black/10"
           }`}
         >
           <span
@@ -3095,7 +2691,7 @@ function TrajectoryDrawPad({
         </span>
       </button>
 
-      <div className="relative aspect-square overflow-hidden rounded-lg border border-white/15 bg-[#15171c]">
+      <div className="relative aspect-square overflow-hidden rounded-lg border border-black/10 bg-[#f1f1ef]">
         <svg
           viewBox="0 0 100 100"
           role="application"
@@ -3157,7 +2753,7 @@ function TrajectoryDrawPad({
           )}
           <path
             d="M25 0V100M50 0V100M75 0V100M0 25H100M0 50H100M0 75H100"
-            stroke="rgba(255,255,255,0.06)"
+            stroke="rgba(0,0,0,0.06)"
             strokeWidth="0.45"
           />
           {projectedPoints.map(([x, y], index) => (
@@ -3166,7 +2762,7 @@ function TrajectoryDrawPad({
               cx={x * 100}
               cy={y * 100}
               r="0.45"
-              fill="rgba(255,255,255,0.28)"
+              fill="rgba(0,0,0,0.3)"
             />
           ))}
           <circle
@@ -3174,7 +2770,7 @@ function TrajectoryDrawPad({
             cy={referencePoint[1] * 100}
             r="1.8"
             fill="#f4b860"
-            stroke="#111216"
+            stroke="#ffffff"
             strokeWidth="0.8"
           />
           {displayedPath.length >= 2 && (
@@ -3184,7 +2780,7 @@ function TrajectoryDrawPad({
                   .map(([x, y]) => `${x * 100},${y * 100}`)
                   .join(" ")}
                 fill="none"
-                stroke="#a9bcff"
+                stroke="#5b5fc7"
                 strokeWidth="2.2"
                 strokeLinecap="round"
                 strokeLinejoin="round"
@@ -3193,13 +2789,13 @@ function TrajectoryDrawPad({
                 cx={projectedPath[0]![0] * 100}
                 cy={projectedPath[0]![1] * 100}
                 r="2.2"
-                fill="#f7f5ef"
+                fill="#1f2937"
               />
               <circle
                 cx={projectedPath.at(-1)![0] * 100}
                 cy={projectedPath.at(-1)![1] * 100}
                 r="2.2"
-                fill="#a9bcff"
+                fill="#5b5fc7"
               />
               <circle
                 cx={projectedPath.at(-1)![0] * 100}
@@ -3215,8 +2811,8 @@ function TrajectoryDrawPad({
                     cx={x * 100}
                     cy={y * 100}
                     r="2.5"
-                    fill={index === segments.length - 1 ? "#a9bcff" : "#15171c"}
-                    stroke="#a9bcff"
+                    fill={index === segments.length - 1 ? "#5b5fc7" : "#15171c"}
+                    stroke="#5b5fc7"
                     strokeWidth="0.7"
                   />
                   <text
@@ -3237,7 +2833,7 @@ function TrajectoryDrawPad({
 
         {path.length < 2 && (
           <div className="pointer-events-none absolute inset-0 grid place-items-center">
-            <span className="rounded-md border border-white/20 bg-[#0b0c0f]/85 px-3 py-2 text-xs font-semibold text-white shadow-xl">
+            <span className="rounded-md border border-black/15 bg-white/90 px-3 py-2 text-xs font-semibold text-neutral-900 shadow-xl">
               DRAG TO DRAW
             </span>
           </div>
@@ -3250,8 +2846,8 @@ function TrajectoryDrawPad({
         onClick={onTogglePivot}
         className={`mt-2 flex h-10 w-full items-center justify-center gap-2 rounded border text-xs font-semibold transition disabled:opacity-25 ${
           addingPivot
-            ? "border-[#a9bcff] bg-[#a9bcff] text-[#10131c]"
-            : "border-[#a9bcff]/40 bg-[#a9bcff]/10 text-[#d8e1ff] hover:bg-[#a9bcff]/20"
+            ? "border-[#5b5fc7] bg-[#5b5fc7] text-neutral-900"
+            : "border-[#5b5fc7]/40 bg-[#5b5fc7]/10 text-[#d8e1ff] hover:bg-[#5b5fc7]/20"
         }`}
       >
         <Plus className="h-3.5 w-3.5" />
@@ -3263,7 +2859,7 @@ function TrajectoryDrawPad({
         onClick={onSmooth}
         disabled={disabled || addingPivot || path.length < 3}
         title="Soften bends in the camera path while keeping camera aim and timing"
-        className="mt-2 flex h-9 w-full items-center justify-center gap-1.5 rounded border border-white/15 bg-white/[0.04] text-xs font-semibold text-white/65 transition hover:border-[#a9bcff]/45 hover:bg-[#a9bcff]/10 hover:text-white disabled:opacity-35"
+        className="mt-2 flex h-9 w-full items-center justify-center gap-1.5 rounded border border-black/10 bg-black/[0.03] text-xs font-semibold text-neutral-700 transition hover:border-[#5b5fc7]/45 hover:bg-[#5b5fc7]/10 hover:text-neutral-900 disabled:opacity-35"
       >
         <Sparkles className="h-3.5 w-3.5" />
         Smooth path
@@ -3273,7 +2869,7 @@ function TrajectoryDrawPad({
         data-close-camera-loop="true"
         disabled={disabled || addingPivot || path.length < 3 || closedLoop}
         onClick={onCloseLoop}
-        className="mt-2 flex h-9 w-full items-center justify-center gap-1.5 rounded border border-white/15 bg-white/[0.04] text-xs font-semibold text-white/65 transition hover:border-[#a9bcff]/45 hover:bg-[#a9bcff]/10 hover:text-white disabled:opacity-35"
+        className="mt-2 flex h-9 w-full items-center justify-center gap-1.5 rounded border border-black/10 bg-black/[0.03] text-xs font-semibold text-neutral-700 transition hover:border-[#5b5fc7]/45 hover:bg-[#5b5fc7]/10 hover:text-neutral-900 disabled:opacity-35"
       >
         <Rotate3D className="h-3.5 w-3.5" />
         {closedLoop ? "Loop closed" : "Close loop"}
@@ -3281,7 +2877,7 @@ function TrajectoryDrawPad({
 
       {segments.length > 0 && (
         <div className="mt-2 flex items-center gap-2">
-          <span className="shrink-0 text-[9px] font-semibold uppercase tracking-[0.1em] text-white/35">
+          <span className="shrink-0 text-[9px] font-semibold uppercase tracking-[0.1em] text-neutral-400">
             Parts
           </span>
           <div className="min-w-0 flex-1 overflow-x-auto">
@@ -3291,15 +2887,15 @@ function TrajectoryDrawPad({
                   key={segment.id}
                   className={`flex h-7 overflow-hidden rounded border text-[10px] font-semibold transition ${
                     segment.id === selectedSegmentId
-                      ? "border-[#a9bcff]/60 bg-[#a9bcff]/15 text-white"
-                      : "border-white/15 bg-white/[0.04] text-white/65"
+                      ? "border-[#5b5fc7]/60 bg-[#5b5fc7]/15 text-neutral-900"
+                      : "border-black/10 bg-black/[0.03] text-neutral-700"
                   }`}
                 >
                   <button
                     type="button"
                     disabled={disabled}
                     onClick={() => onSelectPart(segment.id)}
-                    className="px-2 transition hover:bg-white/10 disabled:opacity-30"
+                    className="px-2 transition hover:bg-black/5 disabled:opacity-30"
                     aria-label={`Edit path part ${index + 1}`}
                   >
                     {index + 1}
@@ -3309,7 +2905,7 @@ function TrajectoryDrawPad({
                     disabled={disabled}
                     onClick={() => onDeletePart(segment.id)}
                     aria-label={`Delete path part ${index + 1}`}
-                    className="border-l border-current/15 px-1.5 transition hover:bg-red-400/15 hover:text-red-100 disabled:opacity-30"
+                    className="border-l border-current/15 px-1.5 transition hover:bg-red-400/15 hover:text-red-700 disabled:opacity-30"
                   >
                     <X className="h-3 w-3" />
                   </button>
@@ -3323,14 +2919,14 @@ function TrajectoryDrawPad({
       {path.length >= 2 && (
         <details
           data-path-shape-panel="true"
-          className="group mt-2 rounded-lg border border-white/15 bg-white/[0.025]"
+          className="group mt-2 rounded-lg border border-black/10 bg-black/[0.02]"
         >
-          <summary className="flex h-9 cursor-pointer list-none items-center justify-between px-2.5 text-xs font-semibold text-white/65 transition hover:bg-white/[0.05] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#a9bcff] [&::-webkit-details-marker]:hidden">
+          <summary className="flex h-9 cursor-pointer list-none items-center justify-between px-2.5 text-xs font-semibold text-neutral-700 transition hover:bg-black/5 hover:text-neutral-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#5b5fc7] [&::-webkit-details-marker]:hidden">
             <span>Shape path</span>
             <ChevronDown className="h-3.5 w-3.5 transition group-open:rotate-180" />
           </summary>
-          <div className="border-t border-white/10 p-2.5">
-            <p className="text-[9px] font-semibold uppercase tracking-[0.1em] text-white/35">
+          <div className="border-t border-black/10 p-2.5">
+            <p className="text-[9px] font-semibold uppercase tracking-[0.1em] text-neutral-400">
               Apply to
             </p>
             <div
@@ -3346,8 +2942,8 @@ function TrajectoryDrawPad({
                 onClick={() => setShapeScope("selected")}
                 className={`h-8 rounded-md border px-2 text-[10px] font-semibold transition disabled:opacity-30 ${
                   effectiveShapeScope === "selected"
-                    ? "border-[#a9bcff] bg-[#a9bcff] text-[#10131c]"
-                    : "border-white/15 text-white/55 hover:border-white/30 hover:text-white"
+                    ? "border-[#5b5fc7] bg-[#5b5fc7] text-neutral-900"
+                    : "border-black/10 text-neutral-600 hover:border-black/25 hover:text-neutral-900"
                 }`}
               >
                 {selectedPartIndex >= 0
@@ -3361,8 +2957,8 @@ function TrajectoryDrawPad({
                 onClick={() => setShapeScope("whole")}
                 className={`h-8 rounded-md border px-2 text-[10px] font-semibold transition ${
                   effectiveShapeScope === "whole"
-                    ? "border-[#a9bcff] bg-[#a9bcff] text-[#10131c]"
-                    : "border-white/15 text-white/55 hover:border-white/30 hover:text-white"
+                    ? "border-[#5b5fc7] bg-[#5b5fc7] text-neutral-900"
+                    : "border-black/10 text-neutral-600 hover:border-black/25 hover:text-neutral-900"
                 }`}
               >
                 Whole path
@@ -3403,13 +2999,13 @@ function TrajectoryDrawPad({
                         : null,
                     )
                   }
-                  className="min-h-9 rounded-md border border-white/15 bg-white/[0.04] px-1.5 text-[10px] font-semibold leading-3 text-white/60 transition hover:border-[#a9bcff]/45 hover:bg-[#a9bcff]/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] disabled:cursor-not-allowed disabled:opacity-25"
+                  className="min-h-9 rounded-md border border-black/10 bg-black/[0.03] px-1.5 text-[10px] font-semibold leading-3 text-neutral-600 transition hover:border-[#5b5fc7]/45 hover:bg-[#5b5fc7]/10 hover:text-neutral-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5b5fc7] disabled:cursor-not-allowed disabled:opacity-25"
                 >
                   {label}
                 </button>
               ))}
             </div>
-            <p className="mt-2 text-[9px] leading-3.5 text-white/35">
+            <p className="mt-2 text-[9px] leading-3.5 text-neutral-400">
               Circular and Flatten use the current 3D view. Camera aim and
               timing stay unchanged.
             </p>
@@ -3422,7 +3018,7 @@ function TrajectoryDrawPad({
           type="button"
           disabled={disabled || path.length === 0}
           onClick={onClear}
-          className="flex h-9 items-center justify-center gap-1.5 rounded border border-white/15 text-xs font-semibold text-white/60 transition hover:bg-white/10 hover:text-white disabled:opacity-25"
+          className="flex h-9 items-center justify-center gap-1.5 rounded border border-black/10 text-xs font-semibold text-neutral-600 transition hover:bg-black/5 hover:text-neutral-900 disabled:opacity-25"
         >
           <Trash2 className="h-3.5 w-3.5" />
           Clear path
@@ -3431,7 +3027,7 @@ function TrajectoryDrawPad({
           type="button"
           disabled={path.length < 2}
           onClick={onPlay}
-          className="flex h-9 items-center justify-center gap-1.5 rounded bg-[#a9bcff] text-xs font-semibold text-[#10131c] transition hover:bg-[#c0cdff] disabled:opacity-25"
+          className="flex h-9 items-center justify-center gap-1.5 rounded bg-[#5b5fc7] text-xs font-semibold text-[#10131c] transition hover:bg-[#4a4eb3] disabled:opacity-25"
         >
           {previewing ? (
             <Pause className="h-3.5 w-3.5" />
@@ -3484,7 +3080,7 @@ function OutputNumberInput({
 
   return (
     <label className="w-20 shrink-0" title={title}>
-      <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.08em] text-white/45">
+      <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.08em] text-neutral-500">
         {label}
       </span>
       <input
@@ -3504,903 +3100,8 @@ function OutputNumberInput({
             event.currentTarget.blur();
           }
         }}
-        className="h-11 w-full rounded-md border border-white/15 bg-white/[0.06] px-3 text-sm font-semibold text-white outline-none transition hover:border-white/25 focus:border-[#a9bcff] focus:ring-2 focus:ring-[#8ca8ff]/20 disabled:opacity-40"
+        className="h-11 w-full rounded-md border border-black/10 bg-black/[0.04] px-3 text-sm font-semibold text-neutral-900 outline-none transition hover:border-black/25 focus:border-[#5b5fc7] focus:ring-2 focus:ring-[#5b5fc7]/20 disabled:opacity-40"
       />
     </label>
-  );
-}
-
-function UploadScreen({
-  previewUrl,
-  posing,
-  poseElapsed,
-  error,
-  activeSceneName,
-  onResume,
-  onChoose,
-  onDrop,
-  onHistory,
-  onExample,
-}: {
-  previewUrl: string | null;
-  posing: boolean;
-  poseElapsed: number;
-  error: string | null;
-  activeSceneName: string | null;
-  onResume: (() => void) | null;
-  onChoose: () => void;
-  onDrop: (file: File) => void;
-  onHistory: () => void;
-  onExample: () => void;
-}) {
-  return (
-    <main className="relative grid h-full place-items-center px-5">
-      <button
-        type="button"
-        onClick={onHistory}
-        className="absolute right-4 top-4 flex h-10 items-center gap-2 rounded-md border border-white/15 px-3 text-sm text-white/60 transition hover:bg-white/[0.06] hover:text-white"
-      >
-        <HistoryIcon className="h-4 w-4" />
-        Saved
-      </button>
-      <div className="w-full max-w-xl">
-        {onResume ? (
-          <button
-            type="button"
-            onClick={onResume}
-            className="mb-7 flex h-11 max-w-full items-center gap-2 rounded-md bg-white px-4 text-sm font-semibold text-black transition hover:bg-white/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] focus-visible:ring-offset-2 focus-visible:ring-offset-[#0b0c0f] active:translate-y-px"
-          >
-            <ArrowLeft className="h-4 w-4 shrink-0" />
-            <span className="truncate">Continue {activeSceneName}</span>
-          </button>
-        ) : (
-          <p className="text-[11px] font-medium uppercase tracking-[0.22em] text-white/40">
-            Step 1 of 3
-          </p>
-        )}
-        <h1 className="mt-4 max-w-lg text-4xl font-medium tracking-[-0.055em] sm:text-5xl">
-          {onResume ? "Start another scene." : "Add a reference image."}
-        </h1>
-        <p className="mt-4 max-w-md text-base leading-6 text-white/55">
-          {onResume
-            ? "Your current scene is still open. Choosing another image replaces it in the editor."
-            : "Then rotate the 3D scene and draw the camera path from any angle."}
-        </p>
-
-        <button
-          type="button"
-          disabled={posing}
-          onClick={onChoose}
-          onDragOver={(event) => event.preventDefault()}
-          onDrop={(event) => {
-            event.preventDefault();
-            const file = event.dataTransfer.files[0];
-            if (file) onDrop(file);
-          }}
-          className="group relative mt-9 flex h-64 w-full items-center justify-center overflow-hidden border border-dashed border-white/25 bg-white/[0.03] text-left transition hover:border-white/50 hover:bg-white/[0.05] disabled:cursor-wait"
-        >
-          {previewUrl ? (
-            <>
-              <img
-                src={previewUrl}
-                alt="Selected reference image"
-                className="absolute inset-0 h-full w-full object-cover opacity-40"
-              />
-              <div className="absolute inset-0 bg-black/45" />
-            </>
-          ) : null}
-          <div className="relative flex flex-col items-center text-center">
-            {posing ? (
-              <>
-                <Loader2 className="h-7 w-7 animate-spin text-white/80" />
-                <span className="mt-4 text-sm font-medium">
-                  Preparing the 3D view
-                </span>
-                <span className="mt-1 text-xs text-white/45">
-                  {Math.max(1, Math.round(poseElapsed / 1000))}s
-                </span>
-              </>
-            ) : (
-              <>
-                <Upload className="h-7 w-7 text-white/60 transition group-hover:text-white" />
-                <span className="mt-4 text-sm font-medium">
-                  Choose an image
-                </span>
-                <span className="mt-1 text-xs text-white/40">
-                  or drop / paste (Ctrl/⌘+V)
-                </span>
-              </>
-            )}
-          </div>
-        </button>
-
-        <button
-          type="button"
-          disabled={posing}
-          onClick={onExample}
-          className="mt-4 flex w-full items-center gap-4 rounded-md border border-[#a9bcff]/30 bg-[#a9bcff]/10 p-3 text-left transition hover:bg-[#a9bcff]/20 disabled:opacity-50"
-        >
-          <img
-            src={EXAMPLE_IMAGE}
-            alt="Cozy igloo example"
-            className="h-16 w-24 rounded object-cover"
-          />
-          <span>
-            <span className="block text-sm font-semibold text-white">
-              Explore an example
-            </span>
-            <span className="mt-1 block text-xs text-white/60">
-              Move cameras and preview a path · No signup needed
-            </span>
-          </span>
-          <Play className="ml-auto h-5 w-5 shrink-0 text-[#a9bcff]" />
-        </button>
-        {error && <p className="mt-3 text-sm text-red-300">{error}</p>}
-      </div>
-    </main>
-  );
-}
-
-function HistoryPanel({
-  getToken,
-  open,
-  history,
-  items,
-  drafts,
-  draftItems,
-  restoringDraftId,
-  onOpenDraft,
-  onGenerationRemoved,
-  onClose,
-}: {
-  getToken: GetToken;
-  open: boolean;
-  history: {
-    isLoading: boolean;
-    error: unknown;
-    refetch: () => Promise<unknown>;
-  };
-  items: readonly CameraTrajectoryHistoryItem[];
-  drafts: {
-    isLoading: boolean;
-    error: unknown;
-    refetch: () => Promise<unknown>;
-  };
-  draftItems: readonly CameraTrajectoryDraftSummary[];
-  restoringDraftId: string | null;
-  onOpenDraft: (draftId: string) => Promise<void>;
-  onGenerationRemoved: (jobId: string) => void;
-  onClose: () => void;
-}) {
-  const [activeTab, setActiveTab] = useState<
-    "favorites" | "generations" | "drafts"
-  >("generations");
-  const [starError, setStarError] = useState<string | null>(null);
-  const [draftStarOverrides, setDraftStarOverrides] = useState(
-    () => new Map<string, boolean>(),
-  );
-  const [generationStarOverrides, setGenerationStarOverrides] = useState(
-    () => new Map<string, boolean>(),
-  );
-  const displayedDraftItems = useMemo(
-    () => applyDraftStarOverrides(draftItems, draftStarOverrides),
-    [draftItems, draftStarOverrides],
-  );
-  const displayedItems = useMemo(
-    () => applyGenerationStarOverrides(items, generationStarOverrides),
-    [generationStarOverrides, items],
-  );
-  const starredDraftIds = useMemo(
-    () =>
-      new Set(
-        displayedDraftItems
-          .filter((draft) => draft.starred)
-          .map((draft) => draft.draft_id),
-      ),
-    [displayedDraftItems],
-  );
-  const sortedDraftItems = useMemo(
-    () =>
-      [...displayedDraftItems].sort(
-        (left, right) => right.saved_at - left.saved_at,
-      ),
-    [displayedDraftItems],
-  );
-  const sortedItems = useMemo(
-    () =>
-      [...displayedItems].sort(
-        (left, right) => right.submitted_at - left.submitted_at,
-      ),
-    [displayedItems],
-  );
-  const favoriteDraftItems = useMemo(
-    () => sortedDraftItems.filter((draft) => draft.starred),
-    [sortedDraftItems],
-  );
-  const favoriteItems = useMemo(
-    () => favoriteHistoryItems(sortedItems),
-    [sortedItems],
-  );
-  const favoriteCount = useMemo(
-    () =>
-      favoriteDraftItems.length +
-      favoriteItems.reduce((count, item) => count + item.variants.length, 0),
-    [favoriteDraftItems.length, favoriteItems],
-  );
-
-  async function toggleDraftStar(draftId: string, starred: boolean) {
-    setStarError(null);
-    setDraftStarOverrides((current) => {
-      const next = new Map(current);
-      next.set(draftId, starred);
-      return next;
-    });
-    try {
-      await setCameraTrajectoryDraftStar(getToken, draftId, starred);
-    } catch (caught) {
-      setDraftStarOverrides((current) => {
-        if (current.get(draftId) !== starred) return current;
-        const next = new Map(current);
-        next.set(draftId, !starred);
-        return next;
-      });
-      setStarError(caught instanceof Error ? caught.message : String(caught));
-    }
-  }
-
-  async function toggleGenerationStar(jobId: string, starred: boolean) {
-    setStarError(null);
-    setGenerationStarOverrides((current) => {
-      const next = new Map(current);
-      next.set(jobId, starred);
-      return next;
-    });
-    try {
-      await setCameraTrajectoryGenerationStar(getToken, jobId, starred);
-    } catch (caught) {
-      setGenerationStarOverrides((current) => {
-        if (current.get(jobId) !== starred) return current;
-        const next = new Map(current);
-        next.set(jobId, !starred);
-        return next;
-      });
-      setStarError(caught instanceof Error ? caught.message : String(caught));
-    }
-  }
-
-  async function removeGeneration(jobId: string) {
-    await deleteCameraTrajectoryGeneration(getToken, jobId);
-    onGenerationRemoved(jobId);
-  }
-
-  if (!open) return null;
-
-  return (
-    <aside className="fixed inset-y-0 right-0 z-[70] flex w-[min(28rem,100%)] flex-col border-l border-white/15 bg-[#111216]/98 shadow-2xl backdrop-blur-xl">
-      <div className="flex items-center justify-between px-5 pb-3 pt-4">
-        <div>
-          <h2 className="text-lg font-semibold tracking-[-0.025em]">
-            Saved scenes
-          </h2>
-          <p className="mt-0.5 text-xs text-white/40">
-            Drafts stay in this browser. Videos expire after 7 days.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close saved scenes"
-          className="grid h-9 w-9 place-items-center rounded-md text-white/50 transition hover:bg-white/10 hover:text-white"
-        >
-          <X className="h-4 w-4" />
-        </button>
-      </div>
-
-      <div
-        role="tablist"
-        aria-label="Saved scene views"
-        className="grid grid-cols-3 gap-1 border-b border-white/10 px-3 pb-3"
-      >
-        <HistoryTabButton
-          active={activeTab === "favorites"}
-          count={favoriteCount}
-          label="Favorites"
-          onClick={() => setActiveTab("favorites")}
-        />
-        <HistoryTabButton
-          active={activeTab === "generations"}
-          count={sortedItems.length}
-          label="Generations"
-          onClick={() => setActiveTab("generations")}
-        />
-        <HistoryTabButton
-          active={activeTab === "drafts"}
-          count={sortedDraftItems.length}
-          label="Drafts"
-          onClick={() => setActiveTab("drafts")}
-        />
-      </div>
-
-      <div className="min-h-0 flex-1 overflow-y-auto p-3">
-        {starError && (
-          <p className="mb-3 rounded-md border border-red-400/20 bg-red-950/40 p-3 text-xs text-red-200">
-            Could not update favorite: {starError}
-          </p>
-        )}
-
-        {activeTab === "favorites" &&
-          (history.isLoading && drafts.isLoading && favoriteCount === 0 ? (
-            <div className="grid h-24 place-items-center">
-              <Loader2 className="h-4 w-4 animate-spin text-white/45" />
-            </div>
-          ) : favoriteCount === 0 ? (
-            <p className="rounded-lg border border-dashed border-white/10 px-3 py-8 text-center text-xs text-white/35">
-              Star a video or path to keep it here.
-            </p>
-          ) : (
-            <div className="space-y-5">
-              {favoriteItems.length > 0 && (
-                <section>
-                  <h3 className="mb-2 px-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/40">
-                    Videos
-                  </h3>
-                  <div className="space-y-2">
-                    {favoriteItems.map((item) => (
-                      <QueueItem
-                        key={item.iteration_id}
-                        getToken={getToken}
-                        item={item}
-                        pathStarred={starredDraftIds.has(item.iteration_id)}
-                        showPathStar={false}
-                        onStarPath={(starred) =>
-                          toggleDraftStar(item.iteration_id, starred)
-                        }
-                        onStarGeneration={toggleGenerationStar}
-                        onRemoveGeneration={removeGeneration}
-                      />
-                    ))}
-                  </div>
-                </section>
-              )}
-              {favoriteDraftItems.length > 0 && (
-                <section>
-                  <h3 className="mb-2 px-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/40">
-                    Paths
-                  </h3>
-                  <div className="space-y-2">
-                    {favoriteDraftItems.map((draft) => (
-                      <DraftItem
-                        key={draft.draft_id}
-                        draft={draft}
-                        restoring={restoringDraftId === draft.draft_id}
-                        onOpen={onOpenDraft}
-                        onStar={(starred) =>
-                          toggleDraftStar(draft.draft_id, starred)
-                        }
-                      />
-                    ))}
-                  </div>
-                </section>
-              )}
-            </div>
-          ))}
-
-        {activeTab === "generations" &&
-          (history.isLoading && sortedItems.length === 0 ? (
-            <div className="grid h-24 place-items-center">
-              <Loader2 className="h-4 w-4 animate-spin text-white/45" />
-            </div>
-          ) : history.error && sortedItems.length === 0 ? (
-            <p className="rounded-md border border-red-400/20 bg-red-950/40 p-3 text-sm text-red-200">
-              {history.error instanceof Error
-                ? history.error.message
-                : "Could not load generations"}
-            </p>
-          ) : sortedItems.length > 0 ? (
-            <div className="space-y-2">
-              {history.isLoading && (
-                <p className="flex items-center gap-2 rounded-md border border-white/10 bg-white/[0.04] px-3 py-2 text-xs text-white/55">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  Loading earlier generations…
-                </p>
-              )}
-              {sortedItems.map((item) => (
-                <QueueItem
-                  key={item.iteration_id}
-                  getToken={getToken}
-                  item={item}
-                  pathStarred={starredDraftIds.has(item.iteration_id)}
-                  onStarPath={(starred) =>
-                    toggleDraftStar(item.iteration_id, starred)
-                  }
-                  onStarGeneration={toggleGenerationStar}
-                  onRemoveGeneration={removeGeneration}
-                />
-              ))}
-            </div>
-          ) : (
-            <p className="rounded-lg border border-dashed border-white/10 px-3 py-8 text-center text-xs text-white/35">
-              Generated versions will appear here.
-            </p>
-          ))}
-
-        {activeTab === "drafts" &&
-          (drafts.isLoading && sortedDraftItems.length === 0 ? (
-            <div className="grid h-24 place-items-center">
-              <Loader2 className="h-4 w-4 animate-spin text-white/45" />
-            </div>
-          ) : drafts.error && sortedDraftItems.length === 0 ? (
-            <p className="rounded-md border border-red-400/20 bg-red-950/40 p-3 text-sm text-red-200">
-              {drafts.error instanceof Error
-                ? drafts.error.message
-                : "Could not load drafts"}
-            </p>
-          ) : sortedDraftItems.length > 0 ? (
-            <div className="space-y-2">
-              {sortedDraftItems.map((draft) => (
-                <DraftItem
-                  key={draft.draft_id}
-                  draft={draft}
-                  restoring={restoringDraftId === draft.draft_id}
-                  onOpen={onOpenDraft}
-                  onStar={(starred) => toggleDraftStar(draft.draft_id, starred)}
-                />
-              ))}
-            </div>
-          ) : (
-            <p className="rounded-lg border border-dashed border-white/10 px-3 py-8 text-center text-xs text-white/35">
-              Generate or save a draft to keep the editable scene here.
-            </p>
-          ))}
-      </div>
-    </aside>
-  );
-}
-
-function HistoryTabButton({
-  active,
-  count,
-  label,
-  onClick,
-}: {
-  active: boolean;
-  count: number;
-  label: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={active}
-      onClick={onClick}
-      className={`flex h-10 min-w-0 items-center justify-center gap-1.5 rounded-md px-2 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff]/70 ${
-        active
-          ? "bg-white text-[#10131c]"
-          : "text-white/50 hover:bg-white/[0.06] hover:text-white"
-      }`}
-    >
-      <span className="truncate">{label}</span>
-      <span
-        className={`rounded-full px-1.5 py-0.5 text-[9px] tabular-nums ${
-          active ? "bg-black/10 text-black/55" : "bg-white/[0.07] text-white/40"
-        }`}
-      >
-        {count}
-      </span>
-    </button>
-  );
-}
-
-function DraftItem({
-  draft,
-  restoring,
-  onOpen,
-  onStar,
-}: {
-  draft: CameraTrajectoryDraftSummary;
-  restoring: boolean;
-  onOpen: (draftId: string) => Promise<void>;
-  onStar: (starred: boolean) => Promise<void>;
-}) {
-  const [copied, setCopied] = useState(false);
-
-  return (
-    <article className="rounded-lg border border-[#a9bcff]/20 bg-[#a9bcff]/[0.05] p-3">
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-[11px] text-white/40">
-          {new Intl.DateTimeFormat(undefined, {
-            month: "short",
-            day: "numeric",
-            hour: "numeric",
-            minute: "2-digit",
-          }).format(new Date(draft.saved_at * 1000))}
-        </span>
-        <div className="flex items-center gap-2">
-          <StarButton starred={draft.starred} label="path" onChange={onStar} />
-          <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[#c0cdff]">
-            Draft
-          </span>
-        </div>
-      </div>
-      <p className="mt-2 line-clamp-2 text-sm leading-5 text-white/85">
-        {draft.prompt || "No prompt yet"}
-      </p>
-      <p className="mt-2 text-xs text-white/35">
-        {draft.point_count} controls · {draft.frame_count} frames · {draft.fps}{" "}
-        FPS · {draft.aspect_ratio}
-      </p>
-      <code className="mt-2 block select-all truncate text-[10px] text-white/35">
-        {draft.draft_id}
-      </code>
-      <div className="mt-3 grid grid-cols-2 gap-2">
-        <button
-          type="button"
-          disabled={restoring}
-          onClick={() => void onOpen(draft.draft_id)}
-          className="flex h-9 items-center justify-center gap-2 rounded-md bg-[#a9bcff] text-xs font-semibold text-[#10131c] transition hover:bg-[#c0cdff] active:translate-y-px disabled:cursor-wait disabled:opacity-40"
-        >
-          {restoring ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <FolderOpen className="h-3.5 w-3.5" />
-          )}
-          {restoring ? "Opening…" : "Open draft"}
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            void navigator.clipboard
-              .writeText(draft.draft_id)
-              .then(() => setCopied(true))
-              .catch(() => setCopied(false));
-          }}
-          className="flex h-9 items-center justify-center gap-2 rounded-md border border-white/15 text-xs font-semibold text-white/65 transition hover:border-white/30 hover:bg-white/[0.06] hover:text-white active:translate-y-px"
-        >
-          <Copy className="h-3.5 w-3.5" />
-          {copied ? "ID copied" : "Copy ID"}
-        </button>
-      </div>
-    </article>
-  );
-}
-
-function QueueItem({
-  getToken,
-  item,
-  pathStarred,
-  showPathStar = true,
-  onStarPath,
-  onStarGeneration,
-  onRemoveGeneration,
-}: {
-  getToken: GetToken;
-  item: CameraTrajectoryHistoryItem;
-  pathStarred: boolean;
-  showPathStar?: boolean;
-  onStarPath: (starred: boolean) => Promise<void>;
-  onStarGeneration: (jobId: string, starred: boolean) => Promise<void>;
-  onRemoveGeneration: (jobId: string) => Promise<void>;
-}) {
-  const [copied, setCopied] = useState(false);
-  const [expanded, setExpanded] = useState(false);
-  const detailsId = `generation-details-${item.iteration_id}`;
-
-  return (
-    <article className="rounded-lg border border-white/10 bg-white/[0.03] p-3">
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-[11px] text-white/40">
-          {new Intl.DateTimeFormat(undefined, {
-            month: "short",
-            day: "numeric",
-            hour: "numeric",
-            minute: "2-digit",
-          }).format(new Date(item.submitted_at * 1000))}
-        </span>
-        <div className="flex items-center gap-2">
-          {showPathStar && item.iteration_id.startsWith("draft_") && (
-            <StarButton
-              starred={pathStarred}
-              label="path"
-              onChange={onStarPath}
-            />
-          )}
-          <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[#c0cdff]">
-            {item.variants.length}{" "}
-            {item.variants.length === 1 ? "video" : "videos"}
-          </span>
-        </div>
-      </div>
-      <button
-        type="button"
-        aria-expanded={expanded}
-        aria-controls={detailsId}
-        aria-label={`${expanded ? "Collapse" : "Expand"} scene ${item.prompt}`}
-        onClick={() => setExpanded((current) => !current)}
-        className="mt-1.5 flex w-full items-center gap-2 rounded-md px-1 py-2 text-left transition hover:bg-white/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff]/70 active:translate-y-px"
-      >
-        <ChevronDown
-          className={`h-4 w-4 shrink-0 text-white/45 transition-transform ${expanded ? "rotate-0" : "-rotate-90"}`}
-        />
-        <span className="line-clamp-2 text-sm leading-5 text-white/85">
-          {item.prompt}
-        </span>
-      </button>
-      {expanded && (
-        <div id={detailsId}>
-          <p className="mt-1 text-xs text-white/35">
-            {item.target_frame_count} frames · {item.fps} FPS ·{" "}
-            {item.aspect_ratio}
-          </p>
-          <div className="mt-2 flex items-center gap-2 rounded-md border border-white/10 bg-black/20 px-2 py-1.5">
-            <code className="min-w-0 flex-1 select-all truncate text-[10px] text-white/45">
-              {item.iteration_id}
-            </code>
-            <button
-              type="button"
-              onClick={() => {
-                void navigator.clipboard
-                  .writeText(item.iteration_id)
-                  .then(() => setCopied(true))
-                  .catch(() => setCopied(false));
-              }}
-              className="flex shrink-0 items-center gap-1 text-[10px] font-semibold text-[#c0cdff] transition hover:text-white"
-            >
-              <Copy className="h-3 w-3" />
-              {copied ? "Copied" : "Copy iteration ID"}
-            </button>
-          </div>
-          <div className="mt-3 space-y-2">
-            {[...item.variants]
-              .sort(
-                (left, right) =>
-                  Number(right.starred) - Number(left.starred) ||
-                  (left.seed ?? Number.MAX_SAFE_INTEGER) -
-                    (right.seed ?? Number.MAX_SAFE_INTEGER),
-              )
-              .map((variant) => (
-                <QueueVariant
-                  key={variant.job_id}
-                  getToken={getToken}
-                  prompt={item.prompt}
-                  iterationId={item.iteration_id}
-                  frameCount={item.target_frame_count}
-                  fps={item.fps}
-                  variant={variant}
-                  onStar={(starred) =>
-                    onStarGeneration(variant.job_id, starred)
-                  }
-                  onRemove={() => onRemoveGeneration(variant.job_id)}
-                />
-              ))}
-          </div>
-        </div>
-      )}
-    </article>
-  );
-}
-
-function QueueVariant({
-  getToken,
-  prompt,
-  iterationId,
-  frameCount,
-  fps,
-  variant,
-  onStar,
-  onRemove,
-}: {
-  getToken: GetToken;
-  prompt: string;
-  iterationId: string;
-  frameCount: number;
-  fps: number;
-  variant: CameraTrajectoryHistoryVariant;
-  onStar: (starred: boolean) => Promise<void>;
-  onRemove: () => Promise<void>;
-}) {
-  const [confirmingRemove, setConfirmingRemove] = useState(false);
-  const [removing, setRemoving] = useState(false);
-  const [removeError, setRemoveError] = useState<string | null>(null);
-  const status = useQuery({
-    queryKey: ["camera-trajectory", variant.job_id],
-    queryFn: () => getCameraTrajectoryStatus(getToken, variant.job_id),
-    enabled: variant.video_uri === null,
-    refetchInterval: (query) =>
-      query.state.data?.state === "running" ? 3000 : false,
-  });
-  const response = status.data?.response;
-  const videoUri = variant.video_uri ?? response?.video_uri ?? null;
-  const [videoUrl, setVideoUrl] = useState<string | null>(null);
-  useEffect(() => {
-    if (!videoUri) return;
-    let cancelled = false,
-      url: string | undefined;
-    const controller = new AbortController();
-    void authFetch(getToken, cameraTrajectoryVideoUrl(videoUri), {
-      signal: controller.signal,
-    })
-      .then((response) => response.blob())
-      .then((blob) => {
-        if (!cancelled) {
-          url = URL.createObjectURL(blob);
-          setVideoUrl(url);
-        }
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-      controller.abort();
-      if (url) URL.revokeObjectURL(url);
-    };
-  }, [videoUri, getToken]);
-  const failure =
-    response?.error ??
-    status.data?.error ??
-    (status.error instanceof Error ? status.error.message : null);
-  const state = videoUrl ? "Ready" : failure ? "Failed" : "Generating";
-  const downloadName = cameraTrajectoryDownloadName({
-    prompt: variant.prompt ?? prompt,
-    iterationId,
-    jobId: variant.job_id,
-    seed: variant.seed,
-    frameCount: variant.target_frame_count ?? frameCount,
-    fps: variant.fps ?? fps,
-    aspectRatio: variant.aspect_ratio,
-  });
-
-  return (
-    <div className="rounded-md border border-white/10 bg-black/20 p-2">
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-xs font-medium text-white/70">
-          Seed {variant.seed ?? "unknown"} · {variant.aspect_ratio}
-        </span>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            aria-label={`Remove seed ${variant.seed ?? "unknown"} from Saved`}
-            title="Remove this version from Saved"
-            disabled={removing}
-            onClick={() => {
-              setRemoveError(null);
-              setConfirmingRemove(true);
-            }}
-            className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-white/10 text-white/35 transition hover:border-red-300/30 hover:bg-red-400/10 hover:text-red-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300/60 disabled:cursor-wait disabled:opacity-50"
-          >
-            {removing ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Trash2 className="h-3.5 w-3.5" />
-            )}
-          </button>
-          <StarButton
-            starred={variant.starred}
-            label={`seed ${variant.seed ?? "unknown"}`}
-            onChange={onStar}
-          />
-          <span
-            className={`text-[10px] font-semibold uppercase tracking-[0.06em] ${
-              videoUrl
-                ? "text-emerald-300"
-                : failure
-                  ? "text-red-300"
-                  : "text-[#f4b860]"
-            }`}
-          >
-            {state}
-          </span>
-        </div>
-      </div>
-      {confirmingRemove && (
-        <div className="mt-2 rounded-md border border-red-300/20 bg-red-950/30 p-2.5">
-          <p className="text-xs leading-5 text-red-100/85">
-            Remove this version from Saved? The path and raw output stay
-            available for recovery.
-          </p>
-          <div className="mt-2 flex justify-end gap-2">
-            <button
-              type="button"
-              disabled={removing}
-              onClick={() => setConfirmingRemove(false)}
-              className="h-8 rounded-md px-3 text-xs font-semibold text-white/55 transition hover:bg-white/[0.06] hover:text-white disabled:opacity-40"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              disabled={removing}
-              onClick={() => {
-                setRemoving(true);
-                setRemoveError(null);
-                void onRemove()
-                  .catch((caught) => {
-                    setRemoveError(
-                      caught instanceof Error ? caught.message : String(caught),
-                    );
-                    setConfirmingRemove(false);
-                  })
-                  .finally(() => setRemoving(false));
-              }}
-              className="h-8 rounded-md bg-red-200 px-3 text-xs font-semibold text-red-950 transition hover:bg-red-100 active:translate-y-px disabled:cursor-wait disabled:opacity-40"
-            >
-              {removing ? "Removing…" : "Remove"}
-            </button>
-          </div>
-        </div>
-      )}
-      {removeError && (
-        <p className="mt-2 text-xs text-red-300">
-          Could not remove this version: {removeError}
-        </p>
-      )}
-      {failure && <p className="mt-2 text-xs text-red-300">{failure}</p>}
-      {videoUrl && (
-        <div className="mt-2 space-y-2">
-          <video
-            src={videoUrl}
-            controls
-            playsInline
-            className="w-full rounded"
-          />
-          <div className="grid grid-cols-2 gap-2">
-            <a
-              href={videoUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="flex h-9 items-center justify-center gap-2 rounded-md border border-white/15 text-xs font-semibold text-white/70 transition hover:border-white/30 hover:bg-white/[0.06] hover:text-white"
-            >
-              <Play className="h-3.5 w-3.5" />
-              Open
-            </a>
-            <a
-              href={videoUrl}
-              download={downloadName}
-              title={`Download ${downloadName}`}
-              className="flex h-9 items-center justify-center gap-2 rounded-md bg-white text-xs font-semibold text-black transition hover:bg-white/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] active:translate-y-px"
-            >
-              <Download className="h-3.5 w-3.5" />
-              Download
-            </a>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function StarButton({
-  starred,
-  label,
-  onChange,
-}: {
-  starred: boolean;
-  label: string;
-  onChange: (starred: boolean) => Promise<void>;
-}) {
-  const [saving, setSaving] = useState(false);
-
-  return (
-    <button
-      type="button"
-      aria-label={`${starred ? "Unstar" : "Star"} ${label}`}
-      aria-pressed={starred}
-      title={`${starred ? "Unstar" : "Star"} ${label}`}
-      disabled={saving}
-      onClick={() => {
-        setSaving(true);
-        void onChange(!starred).finally(() => setSaving(false));
-      }}
-      className={`grid h-8 w-8 shrink-0 place-items-center rounded-md border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#f4b860]/70 disabled:cursor-wait disabled:opacity-50 ${
-        starred
-          ? "border-[#f4b860]/35 bg-[#f4b860]/15 text-[#f4b860] hover:bg-[#f4b860]/25"
-          : "border-white/10 text-white/35 hover:border-white/25 hover:bg-white/[0.06] hover:text-white/70"
-      }`}
-    >
-      {saving ? (
-        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-      ) : (
-        <Star className={`h-3.5 w-3.5 ${starred ? "fill-current" : ""}`} />
-      )}
-    </button>
   );
 }

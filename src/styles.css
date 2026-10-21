@@ -8,19 +8,13 @@
     BlinkMacSystemFont,
     "Segoe UI",
     sans-serif;
-  color: #f7f5ef;
-  background: #0b0c0f;
+  color: #171717;
+  background: #fafaf9;
   font-synthesis: none;
   -webkit-font-smoothing: antialiased;
 }
 body {
   margin: 0;
-}
-button,
-a,
-input,
-select {
-  touch-action: manipulation;
 }
 button:not(:disabled),
 a {
@@ -29,25 +23,11 @@ a {
 button:disabled {
   cursor: not-allowed;
 }
-.studio-shell {
-  height: 100dvh;
-  display: flex;
-  flex-direction: column;
-}
-.studio-editor {
-  min-height: 0;
-  flex: 1;
-}
-.studio-editor > div {
-  height: 100% !important;
-  min-height: 100% !important;
-}
-.loading-screen {
-  height: 100dvh;
-  display: grid;
-  place-content: center;
-  gap: 12px;
-}
-.cl-rootBox {
-  color: #111;
+.place-marker {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #5b5fc7;
+  border: 3px solid white;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.4);
 }

@@ -13,23 +13,3 @@ export type Camera = {
     coordinateSystem: "rub" | "rdf";
   };
 };
-export type Config = {
-  mode: "local" | "hosted";
-  clerkPublishableKey: string | null;
-  freeCredits: number;
-  creditPacks: Array<{ id: string; credits: number; priceCents: number }>;
-  packCredits: number;
-  packPriceCents: number;
-  frames: number;
-  fps: number;
-  apiConfigured: boolean;
-  repoUrl: string | null;
-};
-export type Job = {
-  id: string;
-  kind: "pose" | "generate";
-  status: "queued" | "running" | "succeeded" | "failed";
-  createdAt: number;
-  result: any;
-  error: string | null;
-};

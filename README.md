@@ -1,93 +1,74 @@
-# Atlas Camera Studio
+# Atlas map studio
 
-[Try the hosted app](https://camera.wlt-ai.art) · [Explore an example — no signup](https://camera.wlt-ai.art/?example=igloo) · [Join the API beta waitlist](https://form.typeform.com/to/zHFR4r3A) · [API quickstart](https://atlas-beta.worldlabs.ai/docs/quickstart)
+Plan World Labs Atlas cameras over a photo **and the real terrain around where it was taken**, then generate them in
+one `atlasGenerate` request.
 
-Turn a still image into a camera-controlled shot with the Marble 5 API. Upload a photo, reconstruct its depth, choose a camera path, and generate a four-second MP4.
+Based on [Atlas Camera Studio](https://github.com/worldlabsai/atlas-camera-studio) by World Labs (MIT), whose editor,
+drawing tools and trajectory math come from the original camera-trajectory app by
+[Gowthami Somepalli (@somepago)](https://github.com/somepago). This fork keeps the upstream history. The layout follows
+World Labs' Atlas Preview (viewgen) page: the 3D view, a Spatial Context strip, Add frame, Frame and Video modes, and
+an API view of the request.
 
-Based on the original camera-trajectory editor created by [Gowthami Somepalli (@somepago)](https://github.com/somepago) at World Labs.
+## What it does
 
-This repository contains the complete React editor, Express server, camera math, job runner, and optional hosted-demo billing. The local version uses your own API key. Hosted mode adds Clerk phone verification and one-time Stripe credit packs; there is no Metronome dependency.
+1. **Place**: upload a photo. Its GPS point (and compass heading, if the phone wrote one) come from EXIF; correct
+   both on a small USGS imagery map. Pose the photo with `images2PosedRGBD` (spends credits; cached, never re-run),
+   fetch USGS elevation and imagery around the point, and pick the 16:9 strips of a portrait photo (the middle one,
+   plus strips tilted down so the ground and people at the bottom stay in). The photo is then placed in a local
+   metric frame on the terrain (ground plane, heading, eye at 1.5 m, far depth traced against the terrain), with
+   aerial context frames rendered over the terrain at 520 and 600 m. A registration check shows the photo next to
+   the same view rendered from the terrain, so you can correct the heading.
+2. **Frame / Video**: all context frames are shown as one point cloud (the photo strips and the terrain). Add a
+   camera where you are looking from (**Add frame**), add ready-made parts (a **descent** from 450 m onto the photo's
+   view, an eye-level **circle**, a **walk** around the spot), and draw, aim, smooth and reshape paths with Camera
+   Studio's tools. Click any context frame, camera or generated frame to look through it. Video mode samples the
+   path into frames (default 48, 4 s at 12 fps); Frame mode asks for one view per camera.
+3. **Generate**: the API view shows the exact request (all context frames in use and the target cameras, 1280 × 720
+   with a centred principal point, a fixed seed, an optional prompt, `returnDepth: true`), its cost (~50 credits per
+   view; 1,000 credits = $1) and warnings (cameras under the terrain, more than 600 m up, too many context frames,
+   pure rotation). Nothing is sent until you tick the cost and press Generate. The frames come back with depth and
+   confidence, are shown along the path (also as dots), are fused into a dot cloud (`cloud.ply`), and the request is
+   exported as a package you can resubmit by hand.
 
-![Draw and aim a camera path in the 3D editor](docs/editor.jpg)
+Projects are plain folders in `projects/` (git-ignored), laid out like the October pipeline's folder: `places.json`
+(the place: GPS point, heading, strips), `project.json` (the editor: camera path and settings), `source/aerial/`,
+`work/pose/`, `work/scene/`, `work/gen/<place>-<take>/`, `export/`.
 
-## Example videos
+## Run it
 
-Two camera-controlled videos shared by Jos. Click a preview to open the full MP4; the original files are included in [`examples/`](examples/).
-
-### Original camera demo
-
-[![Generated camera move around a group seated indoors](examples/original-camera-demo.gif)](examples/original-camera-demo.mp4)
-
-The video from Jos's [“what did Ilya see?” post](https://x.com/JosvdWest/status/2094859846982275213). This earlier demo is supplied at 2560 × 1440, 30 FPS, four seconds. [Download MP4](https://github.com/worldlabsai/atlas-camera-studio/raw/refs/heads/main/examples/original-camera-demo.mp4).
-
-### Holographic fish orbit
-
-[![Camera orbit around holographic fish above a city](examples/holographic-fish-orbit.gif)](examples/holographic-fish-orbit.mp4)
-
-Prompt: **“camera orbits around holographic fish”**. Generated with Camera Studio: 1280 × 720, 48 frames at 12 FPS, seed 42. [Download MP4](https://github.com/worldlabsai/atlas-camera-studio/raw/refs/heads/main/examples/holographic-fish-orbit.mp4).
-
-The current app produces four-second videos at 12 FPS. These are output examples; the original source images and saved camera paths are not included.
-
-## Explore without signing up
-
-Choose **Explore an example** to open a prepared igloo scene with an editable camera path. Move or delete cameras, aim them, smooth the path, and preview the move without an account or API key. The public image, EXR depth, and camera metadata are bundled in [`public/example/`](public/example/); no API task runs while you explore.
-
-On the hosted app, sign in and verify a phone number when you want to **Queue video** or prepare your own image. Your example edits stay in the tab through sign-in. Generating the example uses the same credits and limits as any other video. A local fork sends the bundled scene with your own API key; it does not depend on our private asset IDs.
-
-## Run locally
-
-You need Node.js 22.12+ (Node 24 recommended), FFmpeg on your PATH, and an API-enabled World Labs beta account.
-
-1. Clone this repository and run `npm ci`.
-2. Copy `.env.example` to `.env`.
-3. Add your project API key as `WLT_API_KEY`.
-4. Run `npm run build && npm start`.
-5. Open [localhost:3030](http://localhost:3030), upload a JPG, PNG or WebP, to prepare its 3D scene.
-
-The editor crops inputs to 16:9. Rotate the scene, draw a camera path on the map, adjust camera direction, and preview the move before choosing **Queue video**. Each video contains 48 frames at 12 FPS. MP4 encoding runs locally using FFmpeg.
-
-Drag a camera or its numbered point in the 3D view to move it; drag empty space to rotate the scene. Use **Smooth path** to soften bends, and find **Look at point** below Yaw and Pitch. **Delete/Backspace** removes the selected camera. **Cmd/Ctrl-Z** undoes an edit; **Cmd/Ctrl-Shift-Z** redoes it. Each drag or drawn stroke is one undo step.
-
-**Saved** contains drafts, generations, and favorites. Drafts are saved in this browser, separately for each signed-in account (up to 30 drafts), and need their source scene to remain available. Generated videos and scene data expire after seven days; download videos you want to keep.
-
-For development, run `npm run dev` and `npx vite` in separate terminals. The Vite app proxies API requests to port 3030.
-
-### Get an API key
-
-Join the [World Labs beta waitlist](https://form.typeform.com/to/zHFR4r3A) if you don't already have access. Signing up requests access; it does not immediately issue a key.
-
-After your account is enabled, open the [developer portal](https://atlas-beta.worldlabs.ai/developers), select a project, and create an API key with task creation, operation reading, and asset creation/reading permissions. Keep the key in the server's `.env`; never paste it into frontend source or commit it.
-
-The API is currently served from `https://api.atlas-beta.worldlabs.ai/api/v2`. See the [API quickstart](https://atlas-beta.worldlabs.ai/docs/quickstart) for current access and setup details. API charges are billed to the project that owns your key.
-
-## How it works
-
-1. The browser resizes the image to 1280 × 720.
-2. The server calls `tasks:images2PosedRGBD` and polls the returned operation.
-3. The editor decodes the EXR depth map and reconstructs a colored point cloud.
-4. The editor smooths the drawn path and interpolates camera positions and directions into 48 target cameras.
-5. The server calls `tasks:atlasGenerate`, downloads the frames, and encodes an MP4.
-
-The preview is a point cloud used to plan the camera. Generated views can reveal details that are absent from the original image.
-
-## Host a demo
-
-See [hosted setup](docs/hosting.md). Hosted mode requires verified phone ownership before preparing images or generating. Each phone can claim three free generations once, even across accounts. One-time credit packs offer 3 generations for $5, 12 for $20, or 60 for $100 through Stripe Checkout.
-
-Credits are reserved before generation and returned on terminal failure. Duplicate webhooks and repeated job requests do not double-credit or double-charge. Interrupted workers resume stored operation IDs. Job inputs and videos are kept for seven days; download finished shots before they expire.
-
-Local mode has no authentication or paywall and binds to loopback only. Use hosted mode for any shared deployment.
-
-## Verify changes
+You need Node 22.12+, the shared Python env at `../.venv` (torch, opencv, numpy) and the World Labs CLI logged in
+(`worldlabs auth login`). The app never handles an API key: the Python tools use the CLI login.
 
 ```sh
-npm run typecheck
-npm test
-npm run build
+npm ci
+npm start            # builds, then serves http://127.0.0.1:8790
 ```
 
-Tests exercise the original trajectory drawing and camera math, coordinate transforms, ledger concurrency, payment validation, refunds, and job recovery. They do not replace a real Stripe Checkout, SMS verification, and Marble API smoke test before deployment.
+For development, run `npm run dev` and `npx vite` side by side (Vite proxies `/api` and `/files` to port 8790).
 
-## License and credits
+To bring in a place from the October journey without spending credits (the Big Sur project was made this way):
 
-MIT. The editor, drawing controls, and trajectory math are adapted from the original camera-trajectory app created by [Gowthami Somepalli (@somepago)](https://github.com/somepago) at World Labs. Built with Three.js, React Three Fiber, Clerk, Stripe, and FFmpeg. World Labs API usage is subject to the service's own terms and charges.
+```sh
+cd ../october && PLACE_ROOT=../atlas-studio/projects/big-sur ../.venv/bin/python -I ../atlas-studio/tools/studio.py import-october big-sur joint2
+```
+
+## How it fits together
+
+- `server/index.ts`: a small Express server. It keeps projects on disk and runs the Python steps from the `october`
+  folder with `PLACE_ROOT=<project>`, so `../october/tools` (pose, fetch_aerial, build_place, place_cloud,
+  export_request) work on a project unchanged. Pose and generate refuse to run without an explicit confirmation.
+- `tools/studio.py`: EXIF, the October import, the dry-run request (with a terrain check) and the submit, on top of
+  `october/tools/wl.py` (uploads, runs, downloads with retry).
+- `src/`: the editor. `scene.ts` loads every context frame as its own point cloud; `trajectory/` is Camera Studio's
+  editor (paths, aiming, smoothing, undo) adapted to the terrain and a ~1 km scene.
+
+## Data sources and credits
+
+- Elevation: [USGS 3DEP](https://www.usgs.gov/3d-elevation-program); imagery: [USGS NAIP](https://naip-usdaonline.hub.arcgis.com/),
+  both public domain, US only. Map tiles: USGS The National Map.
+- World Labs API usage is billed to your account: `images2PosedRGBD` when posing, `atlasGenerate` (~50 credits per
+  generated view) when generating.
+
+## License
+
+MIT, see [LICENSE](LICENSE) (World Labs' copyright notice is kept).

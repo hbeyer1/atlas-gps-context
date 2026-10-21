@@ -7,7 +7,6 @@ import {
   type RefObject,
 } from "react";
 import {
-  Grid,
   Html,
   Line,
   OrbitControls,
@@ -24,7 +23,7 @@ import { createIntrinsicsFromFov } from "./common";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import { FrustumObject } from "./FrustumObject";
-import type { PosedView } from "./pose";
+import type { Scene } from "../scene";
 import {
   cameraDrawingView,
   cameraPathProgressAtFrame,
@@ -41,12 +40,24 @@ import {
 } from "./camera-trajectory";
 
 const PATH_SAMPLES = 101;
+const NEAR = 0.05;
+const FAR = 20000;
+const BACKGROUND = "#f6f6f4";
+const NO_HIDDEN: ReadonlySet<string> = new Set();
 const SELECTED_CAMERA_RED = "#ff4d5d";
 const SELECTED_CAMERA_DARK_RED = "#3a060d";
 const VIEWER_KEYS = new Set(["w", "a", "s", "d"]);
 
+// The viewport's own camera, kept so "Add frame" can place a camera where you are looking from.
+export type ViewportCamera = RefObject<THREE.PerspectiveCamera | null>;
+
 type CameraTrajectoryCanvasProps = {
-  pose: PosedView;
+  scene: Scene;
+  hiddenClouds: ReadonlySet<string>;
+  /** Look through this camera, its frame fitted to the 16:9 box in the middle of the viewport (as Atlas does). */
+  viewFrom: CameraView | null;
+  onViewFromEnd: () => void;
+  viewportCamera: ViewportCamera;
   referenceView: CameraView;
   views: readonly CameraView[];
   segments: readonly TrajectorySegment[];
@@ -88,12 +99,12 @@ type CameraTrajectoryCanvasProps = {
 };
 
 export function CameraTrajectoryCanvas(props: CameraTrajectoryCanvasProps) {
-  const { pose, referenceView, segments } = props;
+  const { scene, referenceView, segments } = props;
   const viewer = useRef<HTMLDivElement>(null);
   const navigationKeys = useRef(new Set<string>());
   const target = useMemo(
-    () => cameraPathTarget(referenceView, pose.centroidWorld),
-    [pose.centroidWorld, referenceView],
+    () => cameraPathTarget(referenceView, scene.focus),
+    [scene.focus, referenceView],
   );
   const [overviewHome, setOverviewHome] = useState(() => ({
     position: buildOverviewPosition(referenceView.position, target, segments),
@@ -147,7 +158,7 @@ export function CameraTrajectoryCanvas(props: CameraTrajectoryCanvasProps) {
             ? "set"
             : "idle"
       }
-      className={`relative h-full w-full focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#a9bcff]/60 ${props.placingDirectionTarget ? "cursor-crosshair" : ""}`}
+      className={`relative h-full w-full focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#5b5fc7]/60 ${props.placingDirectionTarget ? "cursor-crosshair" : ""}`}
       onPointerDown={(event) =>
         event.currentTarget.focus({ preventScroll: true })
       }
@@ -171,14 +182,14 @@ export function CameraTrajectoryCanvas(props: CameraTrajectoryCanvasProps) {
               ),
             });
           }}
-          className="absolute left-1/2 top-3 z-30 flex h-9 -translate-x-1/2 items-center gap-1.5 rounded-md border border-white/15 bg-[#0b0c0f]/90 px-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-white/65 shadow-lg backdrop-blur transition hover:border-white/30 hover:bg-[#17181d] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#a9bcff] active:translate-y-px"
+          className="absolute bottom-3 left-3 z-30 flex h-9 items-center gap-1.5 rounded-md border border-black/10 bg-white/95 px-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-neutral-700 shadow-lg backdrop-blur transition hover:border-black/25 hover:bg-neutral-100 hover:text-neutral-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5b5fc7] active:translate-y-px"
         >
           <RotateCcw className="h-3.5 w-3.5" />
           Reset view
         </button>
       )}
       {props.placingDirectionTarget && (
-        <div className="pointer-events-none absolute left-1/2 top-3 z-30 flex -translate-x-1/2 items-center gap-2 rounded-lg border border-[#f4b860]/40 bg-[#0b0c0f]/95 p-1.5 pl-3 text-xs font-semibold text-[#ffd18d] shadow-xl backdrop-blur">
+        <div className="pointer-events-none absolute left-1/2 top-16 z-30 flex -translate-x-1/2 items-center gap-2 rounded-lg border border-[#f4b860]/40 bg-white/95 p-1.5 pl-3 text-xs font-semibold text-amber-700 shadow-xl backdrop-blur">
           <span id="look-at-picker-instruction">
             {props.placingDirectionTargetMode === "look_away"
               ? "Click the point to look away from"
@@ -188,7 +199,7 @@ export function CameraTrajectoryCanvas(props: CameraTrajectoryCanvasProps) {
             type="button"
             onPointerDown={(event) => event.stopPropagation()}
             onClick={props.onDirectionTargetCancel}
-            className="pointer-events-auto h-7 rounded border border-white/15 px-2 text-[10px] text-white/65 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#f4b860]"
+            className="pointer-events-auto h-7 rounded border border-black/10 px-2 text-[10px] text-neutral-700 transition hover:bg-black/5 hover:text-neutral-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#f4b860]"
           >
             Cancel
           </button>
@@ -199,12 +210,12 @@ export function CameraTrajectoryCanvas(props: CameraTrajectoryCanvasProps) {
         camera={{
           position: overviewHome.position,
           fov: 50,
-          near: 0.01,
-          far: 1000,
+          near: NEAR,
+          far: FAR,
         }}
         dpr={[1, 1.5]}
-        gl={{ antialias: false }}
-        onCreated={({ gl }) => gl.setClearColor("#111216")}
+        gl={{ antialias: false, logarithmicDepthBuffer: true }}
+        onCreated={({ gl }) => gl.setClearColor(BACKGROUND)}
       >
         <CameraTrajectoryScene
           {...props}
@@ -218,10 +229,10 @@ export function CameraTrajectoryCanvas(props: CameraTrajectoryCanvasProps) {
 }
 
 export function CameraPointCloudView({
-  pose,
+  scene,
   view,
 }: {
-  pose: PosedView;
+  scene: Scene;
   view: CameraView;
 }) {
   return (
@@ -230,15 +241,15 @@ export function CameraPointCloudView({
       camera={{
         position: view.position,
         fov: THREE.MathUtils.radToDeg(view.fovRadians),
-        near: 0.01,
-        far: 1000,
+        near: NEAR,
+        far: FAR,
       }}
       dpr={[1, 1.5]}
       frameloop="demand"
-      gl={{ antialias: false }}
-      onCreated={({ gl }) => gl.setClearColor("#090a0d")}
+      gl={{ antialias: false, logarithmicDepthBuffer: true }}
+      onCreated={({ gl }) => gl.setClearColor(BACKGROUND)}
     >
-      <PosedPointCloud pose={pose} scaleMultiplier={0.7} />
+      <SceneClouds scene={scene} hidden={NO_HIDDEN} scaleMultiplier={0.7} />
       <CameraPointCloudViewCamera view={view} />
     </Canvas>
   );
@@ -263,7 +274,11 @@ function CameraPointCloudViewCamera({ view }: { view: CameraView }) {
 }
 
 function CameraTrajectoryScene({
-  pose,
+  scene,
+  hiddenClouds,
+  viewFrom,
+  onViewFromEnd,
+  viewportCamera,
   referenceView,
   views,
   segments,
@@ -297,6 +312,10 @@ function CameraTrajectoryScene({
   navigationKeys: RefObject<Set<string>>;
 }) {
   const overviewCamera = useThree((state) => state.camera);
+  useEffect(() => {
+    if (overviewCamera instanceof THREE.PerspectiveCamera)
+      viewportCamera.current = overviewCamera;
+  }, [overviewCamera, viewportCamera]);
   const controls = useRef<OrbitControlsImpl>(null);
   const [draggingHandle, setDraggingHandle] = useState(false);
   const lastReportedQuaternion = useRef<THREE.Quaternion | null>(null);
@@ -307,7 +326,7 @@ function CameraTrajectoryScene({
     () =>
       sampleCameraPath(views, PATH_SAMPLES, {
         directionMode,
-        directionTarget: directionTarget ?? pose.centroidWorld,
+        directionTarget: directionTarget ?? scene.focus,
         closedLoop,
         allowBelowFloor,
       }).map((view) => view.position),
@@ -316,7 +335,7 @@ function CameraTrajectoryScene({
       closedLoop,
       directionMode,
       directionTarget,
-      pose.centroidWorld,
+      scene.focus,
       views,
     ],
   );
@@ -326,7 +345,7 @@ function CameraTrajectoryScene({
         ...view,
         ...sampleCameraPivot(views, index, {
           directionMode,
-          directionTarget: directionTarget ?? pose.centroidWorld,
+          directionTarget: directionTarget ?? scene.focus,
           closedLoop,
           allowBelowFloor,
         }),
@@ -335,7 +354,7 @@ function CameraTrajectoryScene({
       views,
       directionMode,
       directionTarget,
-      pose.centroidWorld,
+      scene.focus,
       closedLoop,
       allowBelowFloor,
     ],
@@ -418,23 +437,11 @@ function CameraTrajectoryScene({
         onDrawingViewChange={onDrawingViewChange}
       />
 
-      {!previewing && (
-        <Grid
-          args={[100, 100]}
-          position={[0, -0.002, 0]}
-          cellSize={0.5}
-          cellThickness={0.5}
-          cellColor="#292b31"
-          sectionSize={2.5}
-          sectionThickness={0.8}
-          sectionColor="#3a3d45"
-          infiniteGrid
-          fadeDistance={30}
-          fadeStrength={1.5}
-        />
+      {viewFrom && !previewing && (
+        <ViewFromCamera view={viewFrom} controls={controls} />
       )}
 
-      <PosedPointCloud pose={pose} scaleMultiplier={1} />
+      <SceneClouds scene={scene} hidden={hiddenClouds} scaleMultiplier={1} />
 
       {(directionMode === "look_at" || directionMode === "look_away") &&
         directionTarget &&
@@ -466,7 +473,7 @@ function CameraTrajectoryScene({
         <>
           <Line
             points={linePoints}
-            color={addingPivot ? "#c0cdff" : "#8ca8ff"}
+            color={addingPivot ? "#4a4eb3" : "#5b5fc7"}
             lineWidth={addingPivot ? 4 : 2.5}
             transparent
             opacity={addingPivot ? 1 : 0.9}
@@ -545,8 +552,8 @@ function CameraTrajectoryScene({
             zIndexRange={[20, 0]}
             className="pointer-events-none"
           >
-            <div className="whitespace-nowrap rounded border border-[#f4b860]/50 bg-[#17181d]/90 px-2 py-1 text-[10px] font-semibold text-[#f4b860] shadow-lg backdrop-blur">
-              Reference · not in path
+            <div className="whitespace-nowrap rounded border border-[#f4b860]/50 bg-white/90 px-2 py-1 text-[10px] font-semibold text-amber-600 shadow-lg backdrop-blur">
+              Photo
             </div>
           </Html>
         </>
@@ -560,7 +567,7 @@ function CameraTrajectoryScene({
           previewSeconds={previewSeconds}
           aspectRatio={frameWidth / frameHeight}
           directionMode={directionMode}
-          directionTarget={directionTarget ?? pose.centroidWorld}
+          directionTarget={directionTarget ?? scene.focus}
           closedLoop={closedLoop}
           allowBelowFloor={allowBelowFloor}
           onDone={onPreviewDone}
@@ -577,8 +584,10 @@ function CameraTrajectoryScene({
           !placingDirectionTarget
         }
         target={target}
-        enablePan={false}
+        enablePan
+        screenSpacePanning
         enableDamping
+        onStart={() => viewFrom && onViewFromEnd()}
         dampingFactor={0.08}
         maxPolarAngle={Math.PI - 0.01}
         onChange={() => {
@@ -850,7 +859,7 @@ function DirectionTargetMarker({
       >
         <div
           data-camera-look-target="set"
-          className="whitespace-nowrap rounded border border-[#f4b860]/50 bg-[#17181d]/95 px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.08em] text-[#ffd18d] shadow-lg backdrop-blur"
+          className="whitespace-nowrap rounded border border-[#f4b860]/50 bg-white/95 px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.08em] text-amber-700 shadow-lg backdrop-blur"
         >
           {label}
         </div>
@@ -1118,7 +1127,7 @@ function TrajectoryHandle({
             ),
             extrinsics: { position: [0, 0, 0], quaternion: [0, 0, 0, 1] },
           }}
-          color={selected ? "#ff4d5d" : "#8ca8ff"}
+          color={selected ? "#ff4d5d" : "#5b5fc7"}
           depth={markerDepth}
           overlay
           markers={false}
@@ -1141,7 +1150,7 @@ function TrajectoryHandle({
         <mesh>
           <sphereGeometry args={[1, 24, 16]} />
           <meshBasicMaterial
-            color={dragging || hovered || selected ? "#f7f5ef" : "#a9bcff"}
+            color={dragging || hovered || selected ? "#1f2937" : "#5b5fc7"}
             depthTest={false}
             depthWrite={false}
             toneMapped={false}
@@ -1290,8 +1299,8 @@ function PreviewCamera({
       makeDefault={previewing}
       fov={THREE.MathUtils.radToDeg(views[0]!.fovRadians)}
       aspect={aspectRatio}
-      near={0.01}
-      far={1000}
+      near={NEAR}
+      far={FAR}
     />
   );
 }
@@ -1344,35 +1353,90 @@ function buildOverviewPosition(
     .toArray();
 }
 
-function PosedPointCloud({
-  pose,
+function SceneClouds({
+  scene,
+  hidden,
   scaleMultiplier,
 }: {
-  pose: PosedView;
+  scene: Scene;
+  hidden: ReadonlySet<string>;
+  scaleMultiplier: number;
+}) {
+  return scene.clouds.map((cloud) =>
+    hidden.has(cloud.name) ? null : (
+      <CloudPoints
+        key={cloud.name}
+        cloud={cloud}
+        scaleMultiplier={scaleMultiplier}
+      />
+    ),
+  );
+}
+
+function CloudPoints({
+  cloud,
+  scaleMultiplier,
+}: {
+  cloud: Scene["clouds"][number];
   scaleMultiplier: number;
 }) {
   const geometry = useMemo(() => {
     const g = new THREE.BufferGeometry();
-    g.setAttribute(
-      "position",
-      new THREE.BufferAttribute(pose.points.positions, 3),
-    );
-    g.setAttribute("color", new THREE.BufferAttribute(pose.points.colors, 3));
+    g.setAttribute("position", new THREE.BufferAttribute(cloud.positions, 3));
+    g.setAttribute("color", new THREE.BufferAttribute(cloud.colors, 3));
     return g;
-  }, [pose]);
+  }, [cloud]);
   useEffect(() => () => geometry.dispose(), [geometry]);
   return (
-    <group
-      position={pose.camera.extrinsics.position}
-      quaternion={pose.camera.extrinsics.quaternion}
-    >
-      <points geometry={geometry}>
-        <pointsMaterial
-          vertexColors
-          size={pose.points.pointSize * scaleMultiplier}
-          sizeAttenuation
-        />
-      </points>
-    </group>
+    <points geometry={geometry}>
+      <pointsMaterial
+        vertexColors
+        size={cloud.pointSize * scaleMultiplier}
+        sizeAttenuation
+      />
+    </points>
   );
+}
+
+/** The 16:9 box a camera's frame is shown in: as large as fits, with a margin around it. */
+export function frameBox(width: number, height: number, aspect = 16 / 9) {
+  const w = Math.min(width * 0.84, height * 0.84 * aspect);
+  const h = w / aspect;
+  return { left: (width - w) / 2, top: (height - h) / 2, width: w, height: h };
+}
+
+// Looks through a camera: its vertical field of view fills the frame box, so what is outside the box is what the
+// camera would not see.
+function ViewFromCamera({
+  view,
+  controls,
+}: {
+  view: CameraView;
+  controls: RefObject<OrbitControlsImpl | null>;
+}) {
+  const camera = useThree((state) => state.camera);
+  const size = useThree((state) => state.size);
+  useEffect(() => {
+    if (!(camera instanceof THREE.PerspectiveCamera)) return;
+    const box = frameBox(size.width, size.height);
+    const half = Math.tan(view.fovRadians / 2) * (size.height / box.height);
+    camera.position.set(...view.position);
+    camera.quaternion.set(...view.quaternion);
+    camera.fov = THREE.MathUtils.radToDeg(2 * Math.atan(half));
+    camera.updateProjectionMatrix();
+    camera.updateMatrixWorld();
+    // orbit around a point as far ahead as the photo spot (the origin) is away
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(
+      camera.quaternion,
+    );
+    const pivot = Math.max(5, camera.position.length());
+    controls.current?.target
+      .copy(camera.position)
+      .addScaledVector(forward, pivot);
+    return () => {
+      camera.fov = 50;
+      camera.updateProjectionMatrix();
+    };
+  }, [camera, controls, size, view]);
+  return null;
 }
