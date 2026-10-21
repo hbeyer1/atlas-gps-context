@@ -5,8 +5,9 @@ Run from the october folder with the shared env, PLACE_ROOT pointing at the proj
   cd ~/Documents/Memory-worlds/october && PLACE_ROOT=<project> ../.venv/bin/python -I <studio>/tools/studio.py <command>
 
   exif <photo>                          GPS point, compass heading, size and time of a photo (JSON)
-  import-october <place> [<gen tag>]    copy one place of the October journey into PLACE_ROOT: its places.json entry,
-                                        photo, aerial tiles, pose, scene (context frames) and optionally a generation
+  import-october <place> [--as <name>] [--gen <tag>]
+                                        copy one place of the October journey into PLACE_ROOT (as the project <name>):
+                                        its places.json entry, photo, aerial tiles, pose, scene and optionally a generation
   request <place> <tag>                 the atlasGenerate request for work/gen/<place>-<tag>/ (targets.json and
                                         settings.json written by the server), with local files in place of asset ids
                                         -> request-local.json, and a summary with cost and warnings (JSON). Sends nothing.
@@ -51,7 +52,9 @@ def exif(photo):
     return out
 
 
-def import_october(place, gen_tag=None):
+def import_october(place, *options):
+    opt = lambda k: options[options.index(k) + 1] if k in options else None
+    name, gen_tag = opt("--as") or place, opt("--gen")
     cfg = json.loads((OCTOBER / "places.json").read_text())[place]
     copies = [("source/aerial/" + place + "/" + f) for f in
               ("meta.json", "naip-close.jpg", "naip-wide.jpg", "dem-close.tif", "dem-wide.tif")]
@@ -60,7 +63,7 @@ def import_october(place, gen_tag=None):
     if gen_tag:
         copies.append(f"work/gen/{place}-{gen_tag}")
     for rel in copies:
-        src, dst = OCTOBER / rel, ROOT / rel
+        src, dst = OCTOBER / rel, ROOT / rel.replace(place, name)
         if not src.exists():
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -68,11 +71,12 @@ def import_october(place, gen_tag=None):
             shutil.copytree(src, dst, dirs_exist_ok=True)
         else:
             shutil.copy2(src, dst)
-    (ROOT / "places.json").write_text(json.dumps({place: cfg}, indent=1))
+    cfg["photo"] = cfg["photo"].replace(place, name)
+    (ROOT / "places.json").write_text(json.dumps({name: cfg}, indent=1))
     project = ROOT / "project.json"   # the editor's state; keep what is there
     state = json.loads(project.read_text()) if project.exists() else {}
     project.write_text(json.dumps({**state, "exif": exif(ROOT / cfg["photo"])}, indent=1))
-    return dict(place=place, copied=copies)
+    return dict(place=name, copied=copies)
 
 
 def request(place, tag):

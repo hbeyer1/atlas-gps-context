@@ -1,7 +1,13 @@
-import { FloatType, RedFormat, Vector3 } from "three";
+import { Color, FloatType, RedFormat, SRGBColorSpace, Vector3 } from "three";
 import { EXRLoader } from "three/examples/jsm/loaders/EXRLoader.js";
 import type { Camera } from "./types";
 import { cameraPose } from "./camera";
+
+// Image bytes are sRGB; three.js wants vertex colours linear (or it brightens them a second time).
+const LINEAR = Array.from(
+  { length: 256 },
+  (_, i) => new Color().setRGB(i / 255, 0, 0, SRGBColorSpace).r,
+);
 
 export type PointCloudData = {
   positions: Float32Array;
@@ -88,7 +94,11 @@ export async function decodePointCloud(
         const ix = Math.min(bitmap.width - 1, Math.floor(u)),
           iy = Math.min(bitmap.height - 1, Math.floor(v)),
           ci = (iy * bitmap.width + ix) * 4;
-        colors.push(rgba[ci] / 255, rgba[ci + 1] / 255, rgba[ci + 2] / 255);
+        colors.push(
+          LINEAR[rgba[ci]]!,
+          LINEAR[rgba[ci + 1]]!,
+          LINEAR[rgba[ci + 2]]!,
+        );
       }
     if (signal.aborted) throw new DOMException("Aborted", "AbortError");
     const forward = new Vector3(0, 0, -1).applyQuaternion(pose.quaternion);

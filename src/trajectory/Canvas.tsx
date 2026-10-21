@@ -1425,18 +1425,17 @@ function ViewFromCamera({
     camera.fov = THREE.MathUtils.radToDeg(2 * Math.atan(half));
     camera.updateProjectionMatrix();
     camera.updateMatrixWorld();
-    // orbit around a point as far ahead as the photo spot (the origin) is away
+    // orbit around where the view meets the photo spot's ground level, or a few metres ahead when it looks up
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(
       camera.quaternion,
     );
-    const pivot = Math.max(5, camera.position.length());
+    const pivot =
+      forward.y < -0.1 && camera.position.y > 0
+        ? camera.position.y / -forward.y
+        : 5;
     controls.current?.target
       .copy(camera.position)
       .addScaledVector(forward, pivot);
-    return () => {
-      camera.fov = 50;
-      camera.updateProjectionMatrix();
-    };
   }, [camera, controls, size, view]);
   return null;
 }

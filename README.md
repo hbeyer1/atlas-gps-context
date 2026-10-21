@@ -49,8 +49,13 @@ For development, run `npm run dev` and `npx vite` side by side (Vite proxies `/a
 To bring in a place from the October journey without spending credits (the Big Sur project was made this way):
 
 ```sh
-cd ../october && PLACE_ROOT=../atlas-studio/projects/big-sur ../.venv/bin/python -I ../atlas-studio/tools/studio.py import-october big-sur joint2
+cd ../october && PLACE_ROOT=../atlas-studio/projects/big-sur ../.venv/bin/python -I ../atlas-studio/tools/studio.py import-october big-sur --gen joint2
 ```
+
+`big-sur-coast` is the same place imported `--as big-sur-coast`, with one more aerial context frame so the coast and
+the sea are in the scene: in its `places.json`, `"aerial-coast": [1600, 600, -680, 590]` (1.6 km wide, 600 m up,
+centred 680 m west and 590 m south of the spot; an aerial view's optional third and fourth values move its centre).
+Then **Rebuild** the context frames.
 
 ## How it fits together
 
