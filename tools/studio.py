@@ -13,6 +13,7 @@ Run from the october folder with the shared env, PLACE_ROOT pointing at the proj
                                         -> request-local.json, and a summary with cost and warnings (JSON). Sends nothing.
   submit <place> <tag>                  upload request-local.json's files, run atlasGenerate (spends credits) and
                                         download every frame with its depth and confidence
+  download <place> <tag>                fetch whatever is missing of a finished generation (free, from its result.json)
 
 A project folder is laid out like the october folder (places.json, source/aerial/<place>/, work/pose/<place>/,
 work/scene/<place>/, work/gen/<place>-<tag>/), so the October tools work on it unchanged.
@@ -20,6 +21,7 @@ work/scene/<place>/, work/gen/<place>-<tag>/), so the October tools work on it u
 import json
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -133,20 +135,35 @@ def submit(place, tag):
             return {k: uploaded(v) for k, v in node.items()}
         return [uploaded(v) for v in node] if isinstance(node, list) else node
 
-    resp = wl.response(wl.run("atlasGenerate", uploaded(local), gen))
+    wl.run("atlasGenerate", uploaded(local), gen)
+    return download(place, tag)
+
+
+def download(place, tag):
+    """Every frame, depth and confidence of a finished generation (its result.json), retrying transient failures; files
+    already here are kept. Free: it only reads what the generation made."""
+    gen = ROOT / "work" / "gen" / f"{place}-{tag}"
+    resp = wl.response(json.loads((gen / "result.json").read_text()))
     pu = resp.get("promptUsed")
     (gen / "prompt-used.txt").write_text(pu if isinstance(pu, str) else json.dumps(pu, indent=1))
     for i, fr in enumerate(resp["frames"]):
-        wl.download(fr["imageAsset"]["assetId"], gen / f"frame-{i:02d}.png")
         dep = fr.get("depth") or {}
-        if dep.get("depthAsset"):
-            wl.download(dep["depthAsset"]["assetId"], gen / f"frame-{i:02d}-depth.exr")
-        if dep.get("confidenceAsset"):
-            wl.download(dep["confidenceAsset"]["assetId"], gen / f"frame-{i:02d}-confidence.png")
+        for asset, name in ((fr["imageAsset"], f"frame-{i:02d}.png"), (dep.get("depthAsset"), f"frame-{i:02d}-depth.exr"),
+                            (dep.get("confidenceAsset"), f"frame-{i:02d}-confidence.png")):
+            if not asset or (gen / name).exists():
+                continue
+            for attempt in range(5):   # downloads occasionally fail with a transient "fetch failed"
+                code, out, err = wl.cli("assets", "download", asset["assetId"], "--out", str(gen / name))
+                if not code:
+                    break
+                time.sleep(5 * (attempt + 1))
+            else:
+                sys.exit(f"download failed for {asset['assetId']} ({name}): {err.strip() or out.strip()}")
     return dict(frames=len(resp["frames"]), dir=str(gen))
 
 
 if __name__ == "__main__":
     cmd, args = sys.argv[1], sys.argv[2:]
-    out = {"exif": exif, "import-october": import_october, "request": request, "submit": submit}[cmd](*args)
+    out = {"exif": exif, "import-october": import_october, "request": request, "submit": submit,
+           "download": download}[cmd](*args)
     print(json.dumps(out))
