@@ -13,7 +13,7 @@ an API view of the request.
 
 1. **Place**: upload a photo. Its GPS point (and compass heading, if the phone wrote one) come from EXIF; correct
    both on a small USGS imagery map. Pose the photo with `images2PosedRGBD` (spends credits; cached, never re-run),
-   fetch USGS elevation and imagery around the point, and pick the 16:9 strips of a portrait photo (the middle one,
+   fetch USGS elevation and imagery around the point at full detail (imagery 0.6–1 m, elevation 1–2 m), and pick the 16:9 strips of a portrait photo (the middle one,
    plus strips tilted down so the ground and people at the bottom stay in). The photo is then placed in a local
    metric frame on the terrain (ground plane, heading, eye at 1.5 m, far depth traced against the terrain), with
    aerial context frames rendered over the terrain at 520 and 600 m. A registration check shows the photo next to

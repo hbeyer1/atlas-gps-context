@@ -166,8 +166,8 @@ export function PlacePanel({
         <div>
           <p className="font-semibold text-neutral-900">2 · Map depth data</p>
           <p className="text-neutral-500">
-            USGS 3DEP elevation + NAIP imagery, 600 m and 4 km around the point
-            (US only, free).
+            USGS 3DEP elevation + NAIP imagery at full detail (0.6–1 m), 600 m
+            and 4 km around the point (US only, free).
           </p>
         </div>
         {project.terrain ? (

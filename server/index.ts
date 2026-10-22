@@ -183,11 +183,9 @@ const route =
     try {
       res.json(await handler(req));
     } catch (error) {
-      res
-        .status(400)
-        .json({
-          error: error instanceof Error ? error.message : String(error),
-        });
+      res.status(400).json({
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   };
 
@@ -299,7 +297,7 @@ app.post(
   }),
 );
 
-// USGS 3DEP elevation and NAIP imagery around the point (free, US only).
+// USGS 3DEP elevation and NAIP imagery around the point, at full detail (free, US only).
 app.post(
   "/api/projects/:id/terrain",
   route((req) => {
@@ -313,6 +311,7 @@ app.post(
         id,
         String(lat),
         String(lon),
+        "--fine", // imagery 0.6 m / 1 m, elevation 1 m / 2 m (fetch_aerial.py FINE_SCALES)
       ],
     ]);
   }),
