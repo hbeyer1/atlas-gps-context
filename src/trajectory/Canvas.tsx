@@ -1375,6 +1375,21 @@ function SceneClouds({
   );
 }
 
+// Round dots, as Atlas draws them (three.js draws square points unless given a sprite).
+let dotTexture: THREE.Texture | null = null;
+function roundDot() {
+  if (!dotTexture) {
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 64;
+    const context = canvas.getContext("2d")!;
+    context.arc(32, 32, 31, 0, Math.PI * 2);
+    context.fillStyle = "#fff";
+    context.fill();
+    dotTexture = new THREE.CanvasTexture(canvas);
+  }
+  return dotTexture;
+}
+
 function CloudPoints({
   cloud,
   scaleMultiplier,
@@ -1395,6 +1410,8 @@ function CloudPoints({
         vertexColors
         size={cloud.pointSize * scaleMultiplier}
         sizeAttenuation
+        map={roundDot()}
+        alphaTest={0.5}
       />
     </points>
   );
