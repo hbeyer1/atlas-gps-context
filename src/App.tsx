@@ -210,7 +210,7 @@ export default function App() {
             {project?.id ?? "Projects"}
           </button>
           <span className="text-neutral-300">/</span>
-          <span className="font-medium">Atlas map studio</span>
+          <span className="font-medium">Atlas GPS context</span>
           {project && (
             <>
               <span className="text-neutral-300">/</span>

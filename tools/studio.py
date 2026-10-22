@@ -1,13 +1,14 @@
-"""Atlas map studio's Python side: a few commands the server runs, on top of the October pipeline (../october/tools).
+"""Atlas GPS context's Python side: a few commands the server runs, on top of pipeline/.
 
-Run from the october folder with the shared env, PLACE_ROOT pointing at the project folder:
+Run with PLACE_ROOT pointing at the project folder:
 
-  cd ~/Documents/Memory-worlds/october && PLACE_ROOT=<project> ../.venv/bin/python -I <studio>/tools/studio.py <command>
+  PLACE_ROOT=projects/<name> .venv/bin/python -I tools/studio.py <command>
 
   exif <photo>                          GPS point, compass heading, size and time of a photo (JSON)
   import-october <place> [--as <name>] [--gen <tag>]
-                                        copy one place of the October journey into PLACE_ROOT (as the project <name>):
-                                        its places.json entry, photo, aerial tiles, pose, scene and optionally a generation
+                                        (the author's own data) copy one place of the October memory-world journey
+                                        (../october) into PLACE_ROOT: its places.json entry, photo, aerial tiles, pose,
+                                        scene and optionally a generation
   request <place> <tag>                 the atlasGenerate request for work/gen/<place>-<tag>/ (targets.json and
                                         settings.json written by the server), with local files in place of asset ids
                                         -> request-local.json, and a summary with cost and warnings (JSON). Sends nothing.
@@ -15,8 +16,8 @@ Run from the october folder with the shared env, PLACE_ROOT pointing at the proj
                                         download every frame with its depth and confidence
   download <place> <tag>                fetch whatever is missing of a finished generation (free, from its result.json)
 
-A project folder is laid out like the october folder (places.json, source/aerial/<place>/, work/pose/<place>/,
-work/scene/<place>/, work/gen/<place>-<tag>/), so the October tools work on it unchanged.
+A project folder holds places.json, source/aerial/<place>/, work/pose/<place>/, work/scene/<place>/ and
+work/gen/<place>-<tag>/: the layout the pipeline reads and writes.
 """
 import json
 import shutil
@@ -26,8 +27,8 @@ from pathlib import Path
 
 import numpy as np
 
-OCTOBER = Path(__file__).resolve().parents[2] / "october"
-sys.path.insert(0, str(OCTOBER / "tools"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pipeline"))
+OCTOBER = Path(__file__).resolve().parents[2] / "october"   # the author's October journey, only for import-october
 import wl  # noqa: E402
 from build_place import ROOT, Terrain  # noqa: E402
 

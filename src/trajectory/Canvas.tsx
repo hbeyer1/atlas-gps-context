@@ -1200,7 +1200,9 @@ function OverviewCamera({
 }) {
   const camera = useRef(useThree((state) => state.camera)).current;
   // a canvas mounted while hidden has no size yet: set the view again once it has one
-  const sized = useThree((state) => state.size.width > 0 && state.size.height > 0);
+  const sized = useThree(
+    (state) => state.size.width > 0 && state.size.height > 0,
+  );
 
   useEffect(() => {
     camera.position.set(...home.position);

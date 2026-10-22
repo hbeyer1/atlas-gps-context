@@ -1,6 +1,6 @@
-// Atlas map studio's local server. It serves the editor, keeps each project as a plain folder on disk (laid out like
-// ../october, so the October tools work on it), and runs the Python pipeline for everything that touches World Labs
-// or the map data. It never sees a World Labs key: the Python tools use the CLI login (october/tools/wl.py).
+// Atlas GPS context's local server. It serves the editor, keeps each project as a plain folder on disk (the layout
+// pipeline/ reads and writes), and runs the Python pipeline for everything that touches World Labs or the map data.
+// It never sees a World Labs key: the Python tools use the World Labs CLI login (pipeline/wl.py).
 import express from "express";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -16,9 +16,12 @@ import { dirname, extname, join, resolve } from "node:path";
 
 const PORT = Number(process.env.PORT || 8790);
 const STUDIO = resolve(import.meta.dirname, "..");
-const MEMORY_WORLDS = resolve(STUDIO, "..");
-const OCTOBER = join(MEMORY_WORLDS, "october");
-const PYTHON = join(MEMORY_WORLDS, ".venv", "bin", "python");
+// Python with numpy, opencv-python and pillow: PYTHON, else this folder's .venv, else python3 on the PATH
+const PYTHON =
+  process.env.PYTHON ||
+  (existsSync(join(STUDIO, ".venv", "bin", "python"))
+    ? join(STUDIO, ".venv", "bin", "python")
+    : "python3");
 const PROJECTS = resolve(process.env.PROJECTS_DIR || join(STUDIO, "projects"));
 const CREDITS_PER_VIEW = 50;
 mkdirSync(PROJECTS, { recursive: true });
@@ -33,14 +36,14 @@ type Job = {
   result?: unknown;
 };
 const jobs = new Map<string, Job>();
-const tool = (name: string) => join(OCTOBER, "tools", name);
+const tool = (name: string) => join(STUDIO, "pipeline", name);
 const studioTool = join(STUDIO, "tools", "studio.py");
 
 // One Python command, run the way the October pipeline is run: from the october folder, with the shared env.
 function runPython(project: string, args: string[], log: (s: string) => void) {
   return new Promise<string>((done, fail) => {
     const child = spawn(PYTHON, ["-I", ...args], {
-      cwd: OCTOBER,
+      cwd: STUDIO,
       env: {
         ...process.env,
         PLACE_ROOT: projectDir(project),
@@ -77,7 +80,7 @@ function startJob(project: string, label: string, steps: string[][]) {
   jobs.set(job.id, job);
   (async () => {
     for (const args of steps) {
-      job.log += `$ ${args.map((a) => a.replace(MEMORY_WORLDS + "/", "")).join(" ")}\n`;
+      job.log += `$ ${args.map((a) => a.replace(STUDIO + "/", "")).join(" ")}\n`;
       await runPython(project, args, (s) => (job.log += s));
     }
   })().then(
@@ -420,6 +423,6 @@ app.get("/{*path}", (_req, res) =>
 
 app.listen(PORT, "127.0.0.1", () =>
   console.log(
-    `Atlas map studio on http://127.0.0.1:${PORT} (projects in ${PROJECTS})`,
+    `Atlas GPS context on http://127.0.0.1:${PORT} (projects in ${PROJECTS})`,
   ),
 );
